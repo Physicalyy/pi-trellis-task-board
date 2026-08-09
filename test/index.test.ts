@@ -90,17 +90,23 @@ test("extension activates the model tool only in a trusted Trellis project and r
   assert.equal(tools.length, 1);
   assert.equal(typeof widget, "function");
 
-  const component = (widget as unknown as Function)({}, {});
-  const lines = component.render(32) as string[];
-  assert.ok(lines[0]?.includes("trellis-task-board"));
-  assert.ok(lines.every((line) => visibleWidth(line) <= 32));
-
-  for (const handler of handlers.get("session_shutdown") ?? []) {
-    await handler({}, context(root, true));
+  try {
+    const theme = {
+      fg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+      strikethrough: (text: string) => text,
+    };
+    const component = (widget as unknown as Function)({}, theme);
+    const lines = component.render(32) as string[];
+    assert.ok(lines[0]?.includes("trellis-task-board"));
+    assert.ok(lines.every((line) => visibleWidth(line) <= 32));
+  } finally {
+    for (const handler of handlers.get("session_shutdown") ?? []) {
+      await handler({}, context(root, true));
+    }
+    rmSync(root, { recursive: true, force: true });
+    rmSync(nonTrellis, { recursive: true, force: true });
   }
   assert.equal(widget, undefined);
   assert.equal(status, undefined);
-
-  rmSync(root, { recursive: true, force: true });
-  rmSync(nonTrellis, { recursive: true, force: true });
 });

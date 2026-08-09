@@ -18,7 +18,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { formatStatus, renderFullListLines, renderWidgetLines, truncateToWidth } from "./ui.ts";
+import { formatReason, formatStatus, renderFullListLines, renderWidgetLines, truncateToWidth, type WidgetStyler } from "./ui.ts";
 import { loadSnapshot, type BoardSnapshot, type SessionIdentity } from "./task-state.ts";
 import { setCompleted } from "./mutation.ts";
 
@@ -72,9 +72,18 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
   }
 
   function setBoardWidget(ctx: ExtensionContext): void {
-    ctx.ui.setWidget(WIDGET_KEY, () => ({
+    ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
       render(width: number): string[] {
-        return current ? renderWidgetLines(current, { width }) : [];
+        // Completed rows are dimmed + struck through, the current row is
+        // highlighted, future rows stay plain. Width safety is preserved
+        // because renderWidgetLines truncates the plain text before styling;
+        // the theme only wraps the already-bounded content.
+        const style: WidgetStyler = {
+          dim: (t) => theme.fg("dim", t),
+          strike: (t) => theme.strikethrough(t),
+          highlight: (t) => theme.bold(theme.fg("accent", t)),
+        };
+        return current ? renderWidgetLines(current, { width, style }) : [];
       },
       invalidate() {
         /* snapshot changes replace the widget factory */
@@ -91,7 +100,7 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
     }
     if (current.degraded) {
       setBoardWidget(ctx);
-      ctx.ui.setStatus(WIDGET_KEY, `! ${current.reason ?? "degraded"}`);
+      ctx.ui.setStatus(WIDGET_KEY, `! ${formatReason(current.reason)}`);
       return;
     }
     if (!current.available) {
@@ -197,7 +206,7 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
         const snap = loadSnapshot(ctx.cwd, identity, trusted);
 
         if (params.action === "list") {
-          const text = renderFullListLines(snap).join("\n") || "No Trellis task board.";
+          const text = renderFullListLines(snap).join("\n") || "无 Trellis 任务看板。";
           return {
             content: [{ type: "text", text }],
             details: {
@@ -217,8 +226,8 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
                 type: "text",
                 text:
                   snap.reason === "untrusted"
-                    ? "Board inactive: project is not trusted."
-                    : "Board inactive: no current Trellis task.",
+                    ? "看板未激活：项目不受信任。"
+                    : "看板未激活：无当前 Trellis 任务。",
               },
             ],
             details: { ok: false },
@@ -247,7 +256,7 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
       if (!ctx.hasUI) return;
       if (ctx.mode !== "tui") {
         // Concise non-TUI fallback: surface the summary in the footer status.
-        ctx.ui.setStatus(WIDGET_KEY, snap.degraded ? `! ${snap.reason}` : formatStatus(snap));
+        ctx.ui.setStatus(WIDGET_KEY, snap.degraded ? `! ${formatReason(snap.reason)}` : formatStatus(snap));
         return;
       }
       const lines = renderFullListLines(snap, { width: 10_000 });
@@ -266,7 +275,7 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
           }
           const from = total === 0 ? 0 : offset + 1;
           const to = Math.min(total, offset + pageSize);
-          out.push(theme.fg("dim", `  ↑/↓ line · PgUp/PgDn page · q/Esc close · ${from}-${to}/${total}`));
+          out.push(theme.fg("dim", `  ↑/↓ 行 · PgUp/PgDn 页 · q/Esc 关闭 · ${from}-${to}/${total}`));
           return out;
         }
         return {

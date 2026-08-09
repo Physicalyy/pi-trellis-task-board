@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { applyMarkerChange, normalizeText, parseChecklist } from "./checklist.ts";
 import { isPathInside, loadSnapshot, type SessionIdentity } from "./task-state.ts";
+import { formatReason } from "./ui.ts";
 
 export interface SetCompletedParams {
   item: number;
@@ -48,43 +49,43 @@ export function setCompleted(
   const snap = loadSnapshot(cwd, identity, trusted);
   if (!snap.available) {
     return Promise.resolve(
-      err(snap.reason === "untrusted" ? "Not a trusted project; board inactive." : "No current task; board inactive."),
+      err(snap.reason === "untrusted" ? "项目不受信任；看板未激活。" : "无当前任务；看板未激活。"),
     );
   }
   if (snap.degraded) {
-    return Promise.resolve(err(`Board degraded (${snap.reason}); run list for a fresh snapshot.`));
+    return Promise.resolve(err(`看板异常（${formatReason(snap.reason)}）；请运行 list 获取最新快照。`));
   }
   if (snap.planning) {
-    return Promise.resolve(err("Task is in planning; checklist is not execution-ready."));
+    return Promise.resolve(err("任务处于规划阶段；检查清单尚未可执行。"));
   }
   if (!snap.checklist || snap.checklist.mode !== "checkbox") {
-    return Promise.resolve(err("No mutable checkbox checklist (legacy or none); read-only."));
+    return Promise.resolve(err("无可变复选框清单（旧式或无）；只读。"));
   }
   if (!snap.taskPath) {
-    return Promise.resolve(err("No canonical task path."));
+    return Promise.resolve(err("无规范任务路径。"));
   }
 
   const implPath = join(snap.taskPath, "implement.md");
   if (!existsSync(implPath) || !statSync(implPath).isFile()) {
-    return Promise.resolve(err("implement.md missing in task; cannot mutate."));
+    return Promise.resolve(err("任务中缺少 implement.md；无法修改。"));
   }
   let realImpl: string;
   try {
     realImpl = realpathSync(implPath);
   } catch {
-    return Promise.resolve(err("implement.md not resolvable."));
+    return Promise.resolve(err("无法解析 implement.md。"));
   }
   if (!isPathInside(snap.taskPath, realImpl)) {
-    return Promise.resolve(err("implement.md escapes the canonical task directory."));
+    return Promise.resolve(err("implement.md 超出规范任务目录。"));
   }
 
   return withFileMutationQueue(realImpl, async () => {
     const live = loadSnapshot(cwd, identity, trusted);
     if (!live.available || !live.taskPath || !live.checklist || live.checklist.mode !== "checkbox") {
-      return err("Stale state; run list for a fresh snapshot.");
+      return err("状态已过期；请运行 list 获取最新快照。");
     }
     if (live.planning) {
-      return err("Task moved to planning; run list for a fresh snapshot.");
+      return err("任务已回到规划阶段；请运行 list 获取最新快照。");
     }
     // Re-derive the canonical implement.md from the freshly resolved task and
     // require it to still be the file this queue is locked on.
@@ -93,32 +94,32 @@ export function setCompleted(
     try {
       liveImplReal = realpathSync(liveImpl);
     } catch {
-      return err("Stale implement path; run list for a fresh snapshot.");
+      return err("implement 路径已过期；请运行 list 获取最新快照。");
     }
     if (liveImplReal !== realImpl || !isPathInside(live.taskPath, liveImplReal)) {
-      return err("Active task changed; run list for a fresh snapshot.");
+      return err("当前任务已变更；请运行 list 获取最新快照。");
     }
 
     const current = readFileSync(realImpl, "utf8");
     const parsed = parseChecklist(current);
     if (parsed.mode !== "checkbox") {
-      return err("implement.md no longer has a checkbox checklist; run list.");
+      return err("implement.md 已无复选框清单；请运行 list。");
     }
     // Match by one-based item number against the ordered mutable checkbox list.
     const mutable = parsed.items.filter((it) => it.kind === "checkbox");
     if (params.item < 1 || params.item > mutable.length) {
-      return err(`Item ${params.item} out of range (1..${mutable.length}); run list.`);
+      return err(`条目 ${params.item} 超出范围（1..${mutable.length}）；请运行 list。`);
     }
     const target = mutable[params.item - 1];
     if (target.normalized !== normalizeText(params.expectedText)) {
-      return err(`Item ${params.item} text mismatch; run list for the current board.`);
+      return err(`条目 ${params.item} 文本不匹配；请运行 list 查看当前看板。`);
     }
 
     const { text: nextText, changed } = applyMarkerChange(current, target, params.completed);
     if (!changed) {
-      return ok(`Item ${params.item} already in requested state.`, false);
+      return ok(`条目 ${params.item} 已处于请求状态。`, false);
     }
     writeFileSync(realImpl, nextText, "utf8");
-    return ok(`Updated item ${params.item}.`, true);
+    return ok(`已更新条目 ${params.item}。`, true);
   });
 }

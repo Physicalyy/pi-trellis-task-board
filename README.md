@@ -63,8 +63,15 @@ when all of these hold:
 3. a current task can be uniquely resolved for the Pi session.
 
 Non-Trellis, untrusted, no-task, ambiguous-session and malformed states simply
-deactivate the widget or show a safe `!` degradation note — the board never
-fabricates approval, blockers or an exact Phase 3 position.
+deactivate the widget or show a safe localized `!` degradation note — the board
+never fabricates approval, blockers or an exact Phase 3 position.
+
+For checkbox plans, the compact widget shows recent completed context, labels
+the first unchecked item as `→ 下一步` (next step, not proven in-progress), and
+uses `□` for later pending items. `后续 N 项` counts only genuinely unchecked
+items hidden after the compact window; hidden completed history is not reported
+as remaining work. Fixed UI and mutation messages are displayed in Simplified
+Chinese. Task text itself remains exactly as authored in `implement.md`.
 
 ### `/trellis-tasks`
 
@@ -86,10 +93,10 @@ Trellis task. Legacy numbered plans and planning-state tasks are read-only.
 
 | `task.json.status` | Board display |
 | --- | --- |
-| `planning` | `PLANNING · Phase 1 · awaiting activation` (PRD/Design/Plan/context gates), even if `implement.md` already exists |
-| `in_progress` | `ACTIVE · Phase 2/3 · N/M` when a checkbox checklist exists; otherwise `ACTIVE · Phase 2/3` with no fabricated ratio |
-| `completed` | `COMPLETED · Phase 3` |
-| `review` / unknown | raw sanitized status, no invented phase precision |
+| `planning` | `规划 · 阶段 1 · 等待激活` (PRD/Design/Plan/context gates), even if `implement.md` already exists |
+| `in_progress` | `进行中 · 阶段 2/3 · N/M` when a checkbox checklist exists; otherwise `进行中 · 阶段 2/3` with no fabricated ratio |
+| `completed` | `已完成 · 阶段 3` |
+| `review` / unknown | localized review label or raw sanitized unknown status, with no invented phase precision |
 
 `!` always means *board data degraded/unreadable* (missing, malformed,
 ambiguous or unsafe files) — never a fabricated task blocker.

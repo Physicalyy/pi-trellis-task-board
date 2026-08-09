@@ -85,7 +85,7 @@ test("setCompleted rejects legacy numbered plan", async () => {
     completed: true,
   });
   assert.equal(res.ok, false);
-  assert.match(res.message, /legacy|read-only/i);
+  assert.match(res.message, /旧式|只读/);
   assert.ok(readFileSync(join(dir, "implement.md"), "utf8").includes("1. one"), "no mutation");
   rmSync(root, { recursive: true, force: true });
 });
