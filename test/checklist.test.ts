@@ -74,11 +74,16 @@ test("returns none for empty or unrelated content", () => {
   assert.equal(parseChecklist("just some prose\n- not a checkbox").mode, "none");
 });
 
-test("does not treat checkbox examples outside a Checklist section as execution items", () => {
-  const md = `# Plan\n\n## Validation\n\n- [ ] example only\n`;
+test("scans the whole implementation plan when no Checklist heading exists", () => {
+  const md = `# Implementation Plan\n\n## Phase A\n\n- [ ] first\n\n## Phase B\n\n- [x] second\n`;
   const r = parseChecklist(md);
-  assert.equal(r.mode, "none");
-  assert.equal(r.total, 0);
+  assert.equal(r.mode, "checkbox");
+  assert.equal(r.total, 2);
+  assert.equal(r.completed, 1);
+  assert.deepEqual(
+    r.items.map((i) => i.normalized),
+    ["first", "second"],
+  );
 });
 
 test("normalizeText collapses whitespace and case-folds", () => {

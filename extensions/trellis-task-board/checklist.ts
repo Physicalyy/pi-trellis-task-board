@@ -208,9 +208,7 @@ export function parseChecklist(text: string): ChecklistParseResult {
   const section = findChecklistSection(lines, fence);
   const range = section ?? { start: 0, end: lines.length - 1 };
 
-  const checkboxItems = section
-    ? collectCheckboxItems(lines, fence, range)
-    : [];
+  const checkboxItems = collectCheckboxItems(lines, fence, range);
   if (checkboxItems.length > 0) {
     const mutable = checkboxItems.filter((i) => i.kind === "checkbox");
     return {
