@@ -83,6 +83,8 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
           dim: (t) => theme.fg("dim", t),
           strike: (t) => theme.strikethrough(t),
           highlight: (t) => theme.bold(theme.fg("accent", t)),
+          accent: (t) => theme.fg("accent", t),
+          warning: (t) => theme.fg("warning", t),
         };
         return current ? renderWidgetLines(current, { width, style }) : [];
       },

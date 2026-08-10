@@ -181,6 +181,8 @@ export interface WidgetStyler {
   dim(text: string): string;
   strike(text: string): string;
   highlight(text: string): string;
+  accent?(text: string): string;
+  warning?(text: string): string;
 }
 
 export interface WidgetRenderOptions {
@@ -346,203 +348,254 @@ export function renderFullListLines(view: BoardView, opts?: { width?: number }):
 
 // ── Multi-root aggregate renderers ──────────────────────────────────────
 
-/** Hard cap for the aggregate widget; overflow folds into `+N 个仓库`. */
+/** Hard cap for the aggregate widget. */
 export const MAX_AGGREGATE_WIDGET_ROWS = 8;
 
-function repoTaskGlyph(task: RepositoryTaskSnapshot): string {
-  if (task.statusRaw === "completed") return "✓";
-  if (task.statusRaw === "in_progress") return "→";
-  if (task.statusRaw === "planning") return "□";
-  return "?";
+function repoTaskStatus(task: RepositoryTaskSnapshot): RowStatus {
+  if (task.statusRaw === "completed") return "completed";
+  if (task.statusRaw === "in_progress") return "current";
+  if (task.statusRaw === "planning") return "future";
+  if (task.checklist?.mode === "legacy") return "legacy";
+  return "malformed";
 }
 
-function paddedLine(label: string, suffix: string, width: number): string {
-  // Always reserve room for the suffix so counts/status stay visible even on
-  // narrow terminals; only the label is truncated.
-  const labelWidth = Math.max(0, width - visibleWidth(suffix));
-  const truncatedLabel = truncateToWidth(label, labelWidth);
-  const pad = Math.max(0, labelWidth - visibleWidth(truncatedLabel));
-  return truncateToWidth(`${truncatedLabel}${" ".repeat(pad)}${suffix}`, width).replace(/\s+$/, "");
+function compactLifecycle(statusRaw: string): string {
+  if (statusRaw === "in_progress") return "进行中";
+  if (statusRaw === "planning") return "规划中";
+  if (statusRaw === "completed") return "已完成";
+  if (statusRaw === "review") return "评审中";
+  return statusRaw ? statusRaw.replace(/[-_]+/g, " ").toUpperCase() : "未知";
 }
 
-function repoSummaryLine(repo: RepositorySnapshot, width: number): string {
-  return paddedLine(`仓库  ${repo.relativePath}`, `${repo.counts.completed}/${repo.counts.total} 完成`, width);
+function compactWorkspaceStatus(snapshot: BoardSnapshot): string {
+  const status = compactLifecycle(snapshot.statusRaw ?? "");
+  const checklist = snapshot.checklist;
+  return checklist && checklist.mode === "checkbox" && checklist.total > 0
+    ? `${status} · ${checklist.completed}/${checklist.total}`
+    : status;
 }
 
-function repoProgressLine(task: RepositoryTaskSnapshot, width: number): string {
-  let progress: string;
-  if (task.planning) {
-    progress = "规划中";
-  } else if (task.checklist && task.checklist.mode === "checkbox" && task.checklist.total > 0) {
-    progress = `进行中 ${task.checklist.completed}/${task.checklist.total}`;
-  } else {
-    // No machine-readable checkbox checklist: never fabricate 0/N.
-    progress = "进行中 · 进度不可计算";
+function compactTaskStatus(task: RepositoryTaskSnapshot): string {
+  const status = compactLifecycle(task.statusRaw);
+  const checklist = task.checklist;
+  if (checklist && checklist.mode === "checkbox" && checklist.total > 0) {
+    return `${status} · ${checklist.completed}/${checklist.total}`;
   }
-  const text = `  ├─ → ${task.taskName || task.taskId}  ${progress}`;
-  return truncateToWidth(text, width);
+  return task.statusRaw === "in_progress" ? `${status} · 进度不可计算` : status;
+}
+
+/**
+ * Keep a structural prefix and semantic suffix intact and truncate only the
+ * authored name/path in the middle. Styling is deliberately applied later.
+ */
+export function truncateStructuredRow(prefix: string, body: string, suffix: string, width: number): string {
+  const separator = suffix ? " · " : "";
+  const fixedWidth = visibleWidth(prefix) + visibleWidth(separator) + visibleWidth(suffix);
+  if (fixedWidth >= width) {
+    const prefixText = truncateToWidth(prefix, width);
+    const remaining = Math.max(0, width - visibleWidth(prefixText));
+    return `${prefixText}${truncateToWidth(suffix, remaining)}`.trimEnd();
+  }
+  const bodyWidth = width - fixedWidth;
+  let compactBody = body;
+  if (visibleWidth(body) > bodyWidth) {
+    compactBody = bodyWidth <= 1 ? "" : `${truncateToWidth(body, bodyWidth - 1)}…`;
+  }
+  return `${prefix}${compactBody}${separator}${suffix}`;
+}
+
+function repositorySuffix(repo: RepositorySnapshot, hiddenInProgress = 0): string {
+  let suffix = `${repo.counts.completed}/${repo.counts.total} 完成`;
+  if (hiddenInProgress > 0) suffix += ` · 进行中 ${hiddenInProgress} 项`;
+  else if (repo.counts.total === 0) suffix = "无任务";
+  else if (repo.counts.inProgress === 0 && repo.counts.planning > 0) suffix += ` · 规划中 ${repo.counts.planning}`;
+  else if (repo.counts.inProgress === 0 && repo.counts.review > 0) suffix += ` · 评审中 ${repo.counts.review}`;
+  else if (repo.counts.inProgress === 0 && repo.counts.unknown > 0) suffix += ` · 未知 ${repo.counts.unknown}`;
+  return suffix;
+}
+
+function hasCheckboxProgress(task: RepositoryTaskSnapshot): boolean {
+  return Boolean(task.checklist?.mode === "checkbox" && task.checklist.total > 0);
+}
+
+function widgetTasks(repo: RepositorySnapshot): RepositoryTaskSnapshot[] {
+  const active = repo.tasks
+    .filter((task) => task.statusRaw === "in_progress")
+    .sort((a, b) => Number(hasCheckboxProgress(b)) - Number(hasCheckboxProgress(a)));
+  // Active repositories show every in-progress task. Other repository states
+  // still expose their task glyphs when the global row budget permits.
+  return active.length > 0 ? active : repo.tasks;
+}
+
+function firstUnchecked(task: RepositoryTaskSnapshot): ChecklistItem | null {
+  if (!hasCheckboxProgress(task)) return null;
+  return task.checklist!.items.find((item) => item.kind === "checkbox" && !item.checked) ?? null;
+}
+
+interface AggregateRepoGroup {
+  repo: RepositorySnapshot;
+  tasks: Array<{ task: RepositoryTaskSnapshot; next: ChecklistItem | null }>;
+}
+
+function styleAggregate(text: string, status: RowStatus | "accent" | "warning", style?: WidgetStyler): string {
+  if (!style) return text;
+  if (status === "accent") return style.accent?.(text) ?? text;
+  if (status === "warning") return style.warning?.(text) ?? text;
+  return styleRow(status, text, style);
 }
 
 export function renderAggregateWidgetLines(view: AggregateBoardSnapshot, opts?: WidgetRenderOptions): string[] {
   const width = opts?.width ?? 80;
-  const lines: string[] = [];
-
-  const title = "trellis-task-board";
-  const modeLabel = "多根聚合";
-  const header = title + " ".repeat(Math.max(0, width - visibleWidth(title) - visibleWidth(modeLabel))) + modeLabel;
-  lines.push(truncateToWidth(header, width).replace(/\s+$/, ""));
+  const style = opts?.style;
+  const lines: string[] = [styleAggregate(truncateToWidth("trellis-task-board · 多根聚合", width), "accent", style)];
 
   const ws = view.workspace;
   if (ws.available) {
     const name = ws.taskName || ws.taskId || "(未命名任务)";
-    lines.push(paddedLine(`工作区  ${name}`, formatStatus(ws), width));
+    lines.push(truncateStructuredRow("工作区 ", name, compactWorkspaceStatus(ws), width));
   } else {
-    lines.push(truncateToWidth("工作区  无当前任务", width));
-    if (ws.degraded && ws.reason) {
-      lines.push(truncateToWidth(`  ! ${formatReason(ws.reason)}`, width));
+    lines.push(truncateToWidth("工作区 · 无当前任务", width));
+    if (ws.degraded && ws.reason && lines.length < MAX_AGGREGATE_WIDGET_ROWS) {
+      lines.push(styleAggregate(truncateToWidth(`! ${formatReason(ws.reason)}`, width), "warning", style));
     }
   }
-  for (const d of view.warnings.slice(0, 1)) {
-    lines.push(truncateToWidth(`! ${d.message}`, width));
+  for (const diagnostic of view.warnings.slice(0, 1)) {
+    if (lines.length < MAX_AGGREGATE_WIDGET_ROWS) {
+      lines.push(styleAggregate(truncateToWidth(`! ${diagnostic.message}`, width), "warning", style));
+    }
   }
 
   const sorted = sortRepositories(view.repositories);
-  const maxRepoLines = Math.max(0, MAX_AGGREGATE_WIDGET_ROWS - lines.length);
-  const withProgress = sorted.filter((r) => r.counts.inProgress > 0).length;
-  const estimated = sorted.length + withProgress;
-  const reserveFold = estimated > maxRepoLines ? 1 : 0;
-  let budget = maxRepoLines - reserveFold;
-  let folded = 0;
-  for (const repo of sorted) {
-    if (budget <= 0) {
-      folded++;
-      continue;
-    }
-    budget--;
-    lines.push(repoSummaryLine(repo, width));
-    if (repo.counts.inProgress > 0 && budget > 0) {
-      const task = repo.tasks.find((t) => t.statusRaw === "in_progress");
-      if (task) {
-        budget--;
-        lines.push(repoProgressLine(task, width));
+  let budget = MAX_AGGREGATE_WIDGET_ROWS - lines.length;
+  const needsFold = sorted.length > budget;
+  const visibleCount = Math.max(0, Math.min(sorted.length, budget - (needsFold ? 1 : 0)));
+  const groups: AggregateRepoGroup[] = sorted.slice(0, visibleCount).map((repo) => ({ repo, tasks: [] }));
+  let detailBudget = budget - visibleCount - (needsFold ? 1 : 0);
+
+  // Repository summaries are guaranteed first. Remaining rows are assigned to
+  // task rows, then their concrete next checklist row, in sorted repo order.
+  for (const group of groups) {
+    for (const task of widgetTasks(group.repo)) {
+      if (detailBudget <= 0) break;
+      detailBudget--;
+      let next: ChecklistItem | null = null;
+      const candidate = firstUnchecked(task);
+      if (candidate && detailBudget > 0) {
+        next = candidate;
+        detailBudget--;
       }
+      group.tasks.push({ task, next });
     }
   }
-  if (folded > 0) {
-    lines.push(truncateToWidth(`+${folded} 个仓库折叠（/trellis-tasks 查看全部）`, width));
-  }
+
+  groups.forEach((group, repoIndex) => {
+    const repoLast = repoIndex === groups.length - 1;
+    const repoConnector = repoLast ? "└─ " : "├─ ";
+    const hiddenTasks = group.repo.counts.inProgress > 0
+      ? Math.max(0, group.repo.counts.inProgress - group.tasks.length)
+      : 0;
+    lines.push(
+      truncateStructuredRow(repoConnector, group.repo.relativePath, repositorySuffix(group.repo, hiddenTasks), width),
+    );
+    const outerStem = repoLast ? "   " : "│  ";
+    group.tasks.forEach(({ task, next }, taskIndex) => {
+      const taskLast = taskIndex === group.tasks.length - 1;
+      const taskConnector = taskLast ? "└─ " : "├─ ";
+      const status = repoTaskStatus(task);
+      let suffix = compactTaskStatus(task);
+      const nextIndex = next && task.checklist ? task.checklist.items.indexOf(next) : -1;
+      const hiddenChecklist = nextIndex >= 0 && task.checklist
+        ? task.checklist.items.slice(nextIndex + 1).filter((item) => item.kind === "checkbox" && !item.checked).length
+        : 0;
+      if (hiddenChecklist > 0) suffix += ` · 后续 ${hiddenChecklist} 项`;
+      const taskLine = truncateStructuredRow(
+        `${outerStem}${taskConnector}${rowGlyph(status)} `,
+        task.taskName || task.taskId,
+        suffix,
+        width,
+      );
+      lines.push(styleAggregate(taskLine, status, style));
+      if (next) {
+        const childStem = taskLast ? "   " : "│  ";
+        const nextLine = truncateStructuredRow(`${outerStem}${childStem}└─ → `, `下一步：${next.normalized || next.text}`, "", width);
+        lines.push(styleAggregate(nextLine, "current", style));
+      }
+    });
+  });
+
+  const folded = sorted.length - visibleCount;
+  if (folded > 0) lines.push(truncateToWidth(`+${folded} 仓库折叠 · /trellis-tasks`, width));
   return lines.slice(0, MAX_AGGREGATE_WIDGET_ROWS);
 }
 
 /** Full aggregate list: workspace, writable scope, every repo's tasks and links. */
 export function renderAggregateFullListLines(view: AggregateBoardSnapshot, opts?: { width?: number }): string[] {
   const width = opts?.width ?? 100;
-  const out: string[] = [];
-  out.push(truncateToWidth("trellis-task-board · 多根聚合", width));
-  out.push("");
-
+  const out: string[] = [truncateToWidth("trellis-task-board · 多根聚合", width), ""];
+  const push = (line = ""): void => { out.push(truncateToWidth(line, width)); };
   const ws = view.workspace;
-  out.push(truncateToWidth(`工作区：${view.root}`, width));
+
+  push(`工作区：${view.root}`);
   if (ws.available && ws.taskPath) {
     const name = ws.taskName || ws.taskId || "(未命名任务)";
-    out.push(truncateToWidth(`  当前任务：${ws.taskId ?? basename(ws.taskPath)}`, width));
-    out.push(truncateToWidth(`  标题：${name}`, width));
-    out.push(truncateToWidth(`  状态：${ws.statusRaw ?? "unknown"}`, width));
-    if (ws.checklist && ws.checklist.mode === "checkbox" && ws.checklist.total > 0) {
-      out.push(truncateToWidth(`  子任务：${ws.checklist.completed}/${ws.checklist.total} completed`, width));
-    }
-  } else if (ws.degraded && ws.reason) {
-    out.push(truncateToWidth(`  无当前任务：${formatReason(ws.reason)}`, width));
-  } else {
-    out.push(truncateToWidth("  无当前任务", width));
-  }
-  out.push("");
+    push(`  → ${ws.taskId ?? basename(ws.taskPath)} — ${name} · ${compactWorkspaceStatus(ws)}`);
+  } else if (ws.degraded && ws.reason) push(`  ! 无当前任务：${formatReason(ws.reason)}`);
+  else push("  · 无当前任务");
+  push();
 
-  for (const d of view.warnings) {
-    out.push(truncateToWidth(`! ${d.message}`, width));
-  }
-  if (view.warnings.length > 0) out.push("");
+  for (const diagnostic of view.warnings) push(`! ${diagnostic.message}`);
+  if (view.warnings.length > 0) push();
 
-  // Writable scope: only the root current task's mutable checklist.
-  const writableItems =
-    ws.available && ws.taskPath && ws.checklist && ws.checklist.mode === "checkbox"
-      ? ws.checklist.items.filter((i) => i.kind === "checkbox")
-      : [];
+  const writableItems = ws.available && ws.taskPath && ws.checklist?.mode === "checkbox"
+    ? ws.checklist.items.filter((item) => item.kind === "checkbox")
+    : [];
   if (writableItems.length > 0) {
-    out.push(
-      truncateToWidth(
-        `可写作用域（set_completed 唯一目标）：根任务 ${ws.taskId ?? ""} 的 implement.md 复选框`,
-        width,
-      ),
-    );
-    writableItems.forEach((item, i) => {
-      out.push(truncateToWidth(`  ${i + 1}. [${item.checked ? "x" : " "}] ${item.text}`, width));
-    });
-    out.push("");
-  } else {
-    out.push(truncateToWidth("可写作用域：无（当前根任务无复选框清单）", width));
-    out.push("");
-  }
+    push(`可写作用域（set_completed 唯一目标）：根任务 ${ws.taskId ?? ""} 的 implement.md 复选框`);
+    writableItems.forEach((item, index) => push(`  ${index + 1}. [${item.checked ? "x" : " "}] ${item.text}`));
+  } else push("可写作用域：无（当前根任务无复选框清单）");
+  push();
 
-  for (const repo of view.repositories) {
-    out.push(truncateToWidth(`仓库：${repo.relativePath}`, width));
-    out.push(
-      truncateToWidth(
-        `  任务：${repo.counts.total} · completed ${repo.counts.completed} · in_progress ${repo.counts.inProgress} · planning ${repo.counts.planning} · review ${repo.counts.review} · unknown ${repo.counts.unknown}`,
-        width,
-      ),
-    );
-    out.push("");
+  view.repositories.forEach((repo, repoIndex) => {
+    const repoConnector = repoIndex === view.repositories.length - 1 ? "└─ " : "├─ ";
+    push(`${repoConnector}${repo.relativePath} · ${repositorySuffix(repo)}`);
+    push(`   任务：${repo.counts.total} · completed ${repo.counts.completed} · in_progress ${repo.counts.inProgress} · planning ${repo.counts.planning} · review ${repo.counts.review} · unknown ${repo.counts.unknown}`);
+    const firstUncheckedByTask = new Map<RepositoryTaskSnapshot, number>();
     for (const task of repo.tasks) {
-      out.push(truncateToWidth(`  ${repoTaskGlyph(task)} ${task.taskId}`, width));
-      out.push(truncateToWidth(`    标题：${task.taskName}`, width));
-      out.push(truncateToWidth(`    状态：${task.statusRaw}`, width));
-      if (task.planning) {
-        out.push(truncateToWidth("    进度：规划阶段（进度不可计算）", width));
-      } else if (task.checklist && task.checklist.mode === "checkbox" && task.checklist.total > 0) {
-        out.push(truncateToWidth(`    进度：${task.checklist.completed}/${task.checklist.total}`, width));
-        for (const item of task.checklist.items) {
-          if (item.kind !== "checkbox") continue;
-          out.push(truncateToWidth(`      ${item.checked ? "✓" : "□"} ${item.text}`, width));
-        }
-      } else {
-        out.push(truncateToWidth("    进度：进度不可计算（无机器可读清单）", width));
-      }
-      const link = view.links.find((l) => l.repository === repo && l.repositoryTask === task);
-      if (link) {
-        out.push(truncateToWidth(`    关联：工作区 ${link.workspaceTaskId}（协调状态：${link.workspaceStatus}）`, width));
-        if (!link.statusMatches) {
-          out.push(
-            truncateToWidth(`    协调状态：${link.workspaceStatus}  ⚠ 与实现状态不同（${task.statusRaw}）`, width),
-          );
-        }
-      }
-      out.push("");
+      const checklist = task.checklist;
+      firstUncheckedByTask.set(task, checklist?.mode === "checkbox" ? checklist.items.findIndex((item) => item.kind === "checkbox" && !item.checked) : -1);
     }
-    const failedLinks = view.links.filter((l) => l.repository === repo && !l.repositoryTask && l.warning);
-    for (const link of failedLinks) {
-      out.push(
-        truncateToWidth(
-          `  ! 关联失败：工作区 ${link.workspaceTaskId} → ${link.ownerRepo}:${link.localTask}（${link.warning}）`,
-          width,
-        ),
-      );
-    }
-    if (failedLinks.length > 0) out.push("");
-    for (const w of repo.warnings) {
-      out.push(truncateToWidth(`  ! ${w.message}`, width));
-    }
-    if (repo.warnings.length > 0) out.push("");
-  }
+    repo.tasks.forEach((task, taskIndex) => {
+      const status = repoTaskStatus(task);
+      const connector = taskIndex === repo.tasks.length - 1 ? "└─ " : "├─ ";
+      push(`   ${connector}${rowGlyph(status)} ${task.taskId} — ${task.taskName} · ${compactTaskStatus(task)}`);
+      if (task.planning) push("      进度：规划阶段（进度不可计算）");
+      else if (task.checklist?.mode === "checkbox" && task.checklist.total > 0) {
+        push(`      进度：${task.checklist.completed}/${task.checklist.total}`);
+        const current = firstUncheckedByTask.get(task) ?? -1;
+        task.checklist.items.forEach((item, itemIndex) => {
+          const itemState = itemStatus(item, itemIndex === current);
+          const label = itemState === "current" ? `下一步：${item.text}` : item.text;
+          push(`      ${rowGlyph(itemState)} ${label}`);
+        });
+      } else if (task.checklist?.mode === "legacy") {
+        push("      进度：进度不可计算（旧式清单，只读）");
+        task.checklist.items.forEach((item) => push(`      · ${item.text}`));
+      } else push("      进度：进度不可计算（无机器可读清单）");
 
-  const unmatched = view.links.filter((l) => !l.repository);
-  for (const link of unmatched) {
-    out.push(
-      truncateToWidth(
-        `! 映射失败：工作区 ${link.workspaceTaskId} → ${link.ownerRepo}:${link.localTask}（${link.warning ?? "未匹配"}）`,
-        width,
-      ),
-    );
+      const link = view.links.find((candidate) => candidate.repository === repo && candidate.repositoryTask === task);
+      if (link) {
+        push(`      关联：工作区 ${link.workspaceTaskId}（协调状态：${link.workspaceStatus}）`);
+        if (!link.statusMatches) push(`      协调状态：${link.workspaceStatus} ⚠ 与实现状态不同（${task.statusRaw}）`);
+      }
+    });
+    const failedLinks = view.links.filter((link) => link.repository === repo && !link.repositoryTask && link.warning);
+    for (const link of failedLinks) push(`   ! 关联失败：工作区 ${link.workspaceTaskId} → ${link.ownerRepo}:${link.localTask}（${link.warning}）`);
+    for (const warning of repo.warnings) push(`   ! ${warning.message}`);
+    push();
+  });
+
+  for (const link of view.links.filter((candidate) => !candidate.repository)) {
+    push(`! 映射失败：工作区 ${link.workspaceTaskId} → ${link.ownerRepo}:${link.localTask}（${link.warning ?? "未匹配"}）`);
   }
   return out;
 }

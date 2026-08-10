@@ -13,6 +13,7 @@ import {
   renderAggregateFullListLines,
   renderAggregateWidgetLines,
   visibleWidth,
+  type WidgetStyler,
 } from "../extensions/trellis-task-board/ui.ts";
 
 function checkbox(completed: number, total: number): ChecklistParseResult {
@@ -102,8 +103,9 @@ test("aggregate widget shows title, workspace line and repo summaries", () => {
   assert.ok(lines[0].includes("trellis-task-board"));
   assert.ok(lines[0].includes("多根聚合"));
   assert.ok(lines.some((l) => l.includes("工作区") && l.includes("工作区协调任务")));
-  assert.ok(lines.some((l) => l.includes("仓库") && l.includes("platform/repo-a") && l.includes("1/2 完成")));
+  assert.ok(lines.some((l) => l.includes("platform/repo-a") && l.includes("1/2 完成")));
   assert.ok(lines.some((l) => l.includes("services/repo-b") && l.includes("0/2 完成")));
+  assert.ok(lines.some((l) => /^[├└]─ /.test(l)), "repositories use the old tree connectors");
 });
 
 test("aggregate widget is width-safe", () => {
@@ -121,7 +123,7 @@ test("aggregate widget never exceeds the hard row cap", () => {
   );
   const lines = renderAggregateWidgetLines(aggregate({ repositories: repos }), { width: 80 });
   assert.ok(lines.length <= MAX_AGGREGATE_WIDGET_ROWS, `rows=${lines.length}`);
-  assert.ok(lines.some((l) => /\+N 个仓库折叠|\+\d+ 个仓库折叠/.test(l)), "fold marker present");
+  assert.ok(lines.some((l) => /\+\d+ 仓库折叠 · \/trellis-tasks/.test(l)), "short fold marker present");
 });
 
 test("aggregate widget prioritizes in-progress repos and shows their progress", () => {
@@ -131,7 +133,8 @@ test("aggregate widget prioritizes in-progress repos and shows their progress", 
   const idxA = lines.findIndex((l) => l.includes("platform/repo-a"));
   const idxB = lines.findIndex((l) => l.includes("services/repo-b"));
   assert.ok(idxA >= 0 && idxB >= 0 && idxA < idxB);
-  assert.ok(lines.some((l) => l.includes("进行中 3/12")), "checklist progress of in-progress task shown");
+  assert.ok(lines.some((l) => l.includes("进行中 · 3/12")), "checklist progress of in-progress task shown");
+  assert.ok(lines.some((l) => l.includes("→ 下一步：item 3")), "concrete first unchecked item shown");
 });
 
 test("aggregate widget shows 进度不可计算 for in_progress without a machine-readable checklist", () => {
@@ -158,6 +161,33 @@ test("aggregate widget shows 进度不可计算 for in_progress without a machin
   });
   const legacyLines = renderAggregateWidgetLines(legacyView, { width: 80 });
   assert.ok(legacyLines.some((l) => l.includes("进度不可计算")), "legacy checklist is also 进度不可计算");
+});
+
+test("aggregate widget keeps completed-only, empty, review and unknown repos distinguishable", () => {
+  const completedOnly = renderAggregateWidgetLines(
+    aggregate({ repositories: [repo("d", "platform/done", [task("t1", "completed", checkbox(2, 2))])] }),
+    { width: 80 },
+  ).join("\n");
+  assert.ok(completedOnly.includes("1/1 完成"));
+  assert.ok(completedOnly.includes("✓ Title t1") && completedOnly.includes("已完成 · 2/2"), "completed repo shows task + glyph");
+
+  const empty = renderAggregateWidgetLines(
+    aggregate({ repositories: [repo("e", "platform/empty", [])] }),
+    { width: 80 },
+  ).join("\n");
+  assert.ok(empty.includes("无任务"), "empty repo reports 无任务, never 0/0");
+
+  const review = renderAggregateWidgetLines(
+    aggregate({ repositories: [repo("r", "platform/review", [task("t1", "review", null)])] }),
+    { width: 80 },
+  ).join("\n");
+  assert.ok(review.includes("评审中 1") && review.includes("? Title t1"), "review repo stays distinguishable");
+
+  const unknown = renderAggregateWidgetLines(
+    aggregate({ repositories: [repo("u", "platform/unknown", [task("t1", "weird-state", null)])] }),
+    { width: 80 },
+  ).join("\n");
+  assert.ok(unknown.includes("未知 1") && unknown.includes("? Title t1"), "unknown status stays distinguishable");
 });
 
 test("aggregate widget workspace empty state is explicit", () => {
@@ -199,7 +229,7 @@ test("aggregate full list separates root writable scope from read-only subrepos"
   assert.match(text, /1\. \[x\] item 0/);
   assert.match(text, /2\. \[ \] item 1/);
   // Sub-repo checklist items never expose mutation numbers.
-  const repoBlock = text.slice(text.indexOf("仓库：platform/repo-a"), text.indexOf("仓库：services/repo-b"));
+  const repoBlock = text.slice(text.indexOf("platform/repo-a"), text.indexOf("services/repo-b"));
   assert.ok(repoBlock.includes("item 0"));
   assert.ok(!/\n\s+\d+\. \[/.test(repoBlock), "subrepo items must not carry mutation numbers");
 });
@@ -250,4 +280,65 @@ test("aggregate full list is width-safe at normal and narrow widths", () => {
       assert.ok(visibleWidth(l) <= width, `width overflow at ${width}: ${JSON.stringify(l)}`);
     }
   }
+});
+
+test("aggregate widget preserves old glyphs, applies styles, and draws no border", () => {
+  const style: WidgetStyler = {
+    dim: (text) => `\x1b[2m${text}\x1b[22m`,
+    strike: (text) => `\x1b[9m${text}\x1b[29m`,
+    highlight: (text) => `\x1b[1m${text}\x1b[22m`,
+    accent: (text) => `\x1b[36m${text}\x1b[39m`,
+    warning: (text) => `\x1b[33m${text}\x1b[39m`,
+  };
+  const lines = [
+    ...renderAggregateWidgetLines(aggregate({ repositories: [repo("done", "platform/done", [task("done-task", "completed", checkbox(2, 2))])] }), { width: 80, style }),
+    ...renderAggregateWidgetLines(aggregate({ repositories: [repo("active", "platform/active", [task("active-task", "in_progress", checkbox(0, 2))])] }), { width: 80, style }),
+    ...renderAggregateWidgetLines(aggregate({ repositories: [repo("future", "platform/future", [task("future-task", "planning", null)])] }), { width: 80, style }),
+  ];
+  const text = lines.join("\n");
+  assert.ok(text.includes("✓") && text.includes("→") && text.includes("□"));
+  assert.ok(!/[⏺☒☐]/u.test(text));
+  assert.ok(lines.some((line) => line.includes("\x1b[2m") && line.includes("\x1b[9m") && line.includes("✓")));
+  assert.ok(lines.some((line) => line.includes("\x1b[1m") && line.includes("→")));
+  assert.ok(!lines.some((line) => /^[─━═_]{3,}$/u.test(line.replace(/\x1b\[[0-9;]*m/g, ""))));
+});
+
+test("aggregate widget orders multiple active tasks by machine-readable progress", () => {
+  const view = aggregate({
+    repositories: [repo("a", "platform/repo-a", [
+      task("without-progress", "in_progress", null),
+      task("with-progress", "in_progress", checkbox(1, 3)),
+    ])],
+  });
+  const lines = renderAggregateWidgetLines(view, { width: 80 });
+  const text = lines.join("\n");
+  assert.ok(text.indexOf("Title with-progress") < text.indexOf("Title without-progress"));
+  assert.ok(text.includes("→ 下一步：item 1"));
+  assert.ok(text.includes("进度不可计算"));
+});
+
+test("aggregate widget preserves suffixes and the fold command at 32/48/80 columns", () => {
+  for (const width of [32, 48, 80]) {
+    const lines = renderAggregateWidgetLines(aggregate(), { width });
+    assert.ok(lines.some((line) => line.includes("1/2 完成")), `repo lifecycle suffix at ${width}`);
+    assert.ok(lines.some((line) => line.includes("3/12")), `task checklist suffix at ${width}`);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    assert.ok(!lines.some((line) => /repo-a1\/2|repo-a3\/12/.test(line)), "suffix has a separator");
+  }
+
+  const many = Array.from({ length: 12 }, (_, index) =>
+    repo(`r${index}`, `platform/repo-${index}`, [task(`t${index}`, "planning", null)]),
+  );
+  const narrow = renderAggregateWidgetLines(aggregate({ repositories: many }), { width: 32 });
+  assert.ok(narrow.some((line) => line.includes("/trellis-tasks")), "narrow fold marker keeps the command");
+});
+
+test("aggregate full list shares next-step glyph semantics and keeps repository checklists unnumbered", () => {
+  const text = renderAggregateFullListLines(aggregate(), { width: 120 }).join("\n");
+  assert.ok(text.includes("→ 下一步：item 3"));
+  assert.ok(text.includes("✓ item 0"));
+  assert.ok(text.includes("□ item 4"));
+  assert.ok(!/[⏺☒☐]/u.test(text));
+  const repositoryPart = text.slice(text.indexOf("platform/repo-a"));
+  assert.ok(!/\n\s+\d+\. \[[ x]\]/.test(repositoryPart));
 });

@@ -86,12 +86,15 @@ map, the board switches to a two-layer aggregate view:
 
 - **Workspace layer:** the root's current task (title, lifecycle status and
   checklist ratio), or an explicit `无当前任务` when the session has no task.
-- **Repository layer:** one row per declared package with its completed/total
-  (task lifecycle counts over non-archived tasks only) plus status counts
-  (`in_progress` / `planning` / `review` / `unknown` / `completed`), and the
-  first in-progress task's checklist progress when space allows. The widget is
-  hard-capped at 8 rows; repositories that do not fit fold into
-  `+N 个仓库折叠（/trellis-tasks 查看全部）`.
+- **Repository layer:** declared packages are `├─/└─` group nodes with their
+  completed/total task-lifecycle counts. Repository-local tasks are nested
+  beneath them with the original single-root glyphs: `✓` completed, `→`
+  in-progress/current, `□` planning/future, `·` legacy and `?` unknown. A
+  machine-readable active task is paired with its concrete first unchecked
+  `→ 下一步：...` item when the 8-row budget permits; multiple active tasks are
+  ordered with machine-readable progress first. Missing checklist data is
+  reported as `进度不可计算`, never `0/N`. Repositories that do not fit use the
+  narrow-safe marker `+N 仓库折叠 · /trellis-tasks`.
 
 Package discovery is explicit only:
 
@@ -124,8 +127,10 @@ Configuration outcomes are distinct:
 Opens a full, scrollable list of the board in TUI mode (↑/↓ or PgUp/PgDn to
 scroll, `q`/`Esc` to close) with a concise footer fallback elsewhere. In
 aggregate mode it lists the workspace task, the root writable scope, every
-configured repository's non-archived tasks with checklist progress, all
-links/status differences and every diagnostic.
+configured repository's non-archived tasks with complete checklists, all
+links/status differences and every diagnostic. It uses the same glyph and tree
+semantics as the compact widget while keeping root mutation numbers separate
+from read-only repository checklist glyphs.
 
 ### Model tool: `trellis_task_board`
 
@@ -155,7 +160,13 @@ Trellis task. Legacy numbered plans and planning-state tasks are read-only.
 
 Repository `completed/total` counts task lifecycle status only (non-archived
 tasks); per-task checklist items are never summed into a repository ratio.
-When a checklist has no machine-readable progress the board says
+Aggregate labels and status suffixes stay left-aligned next to their object;
+32/48/80-column rendering preserves the tree prefix and semantic suffix while
+truncating only long titles/paths with `…`. Completed rows are dimmed and struck
+through, current rows use the theme accent plus bold, and future rows remain
+plain, so color is never the only signal. The horizontal line beneath the
+widget is Pi's native editor/widget boundary and is not rendered by this
+package. When a checklist has no machine-readable progress the board says
 `进度不可计算` instead of inventing `0/N`. `!` always means *board data
 degraded/unreadable* (missing, malformed, ambiguous or unsafe files) — never a
 fabricated task blocker.
