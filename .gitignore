@@ -3,3 +3,9 @@ node_modules/
 *.log
 .DS_Store
 .tmp/
+
+# Local Trellis workflow and Pi integration
+.trellis/
+.agents/
+.pi/
+AGENTS.md

@@ -6,10 +6,16 @@ It shows the active task, its real lifecycle status, the coarse workflow phase,
 checkbox completion progress and the current step — without asking the AI to
 report on it.
 
+In **polyrepo workspaces** the widget becomes a multi-root aggregate board: it
+keeps showing the workspace coordination task while also summarizing each
+repository declared in the root `.trellis/config.yaml` `packages` map (all its
+non-archived tasks, lifecycle counts and checklist progress).
+
 - **License:** MIT — see [LICENSE](./LICENSE).
 - **Source of truth:** the project's own Trellis runtime files
-  (`.trellis/.runtime/sessions/<key>.json`, `task.json`, and `implement.md`).
-  No separate session todo list is created.
+  (`.trellis/.runtime/sessions/<key>.json`, `task.json`, and `implement.md`),
+  plus `.trellis/config.yaml` `packages` for multi-root discovery. No separate
+  session todo list is created.
 
 ---
 
@@ -73,16 +79,65 @@ items hidden after the compact window; hidden completed history is not reported
 as remaining work. Fixed UI and mutation messages are displayed in Simplified
 Chinese. Task text itself remains exactly as authored in `implement.md`.
 
+### Multi-root aggregate mode
+
+When the trusted root `.trellis/config.yaml` declares a non-empty `packages`
+map, the board switches to a two-layer aggregate view:
+
+- **Workspace layer:** the root's current task (title, lifecycle status and
+  checklist ratio), or an explicit `无当前任务` when the session has no task.
+- **Repository layer:** one row per declared package with its completed/total
+  (task lifecycle counts over non-archived tasks only) plus status counts
+  (`in_progress` / `planning` / `review` / `unknown` / `completed`), and the
+  first in-progress task's checklist progress when space allows. The widget is
+  hard-capped at 8 rows; repositories that do not fit fold into
+  `+N 个仓库折叠（/trellis-tasks 查看全部）`.
+
+Package discovery is explicit only:
+
+- Packages come solely from the root `config.yaml` `packages` map — never a
+  recursive scan of nested `.trellis/` directories.
+- Only the `path` field is used; `git`, `type` and other fields are ignored.
+- Every package/task path must pass realpath containment inside the workspace
+  root; package self-reference (pointing at the root itself) is rejected and
+  canonical duplicates are deduplicated.
+- `.trellis/tasks/archive/` is fully excluded from every repository: archived
+  tasks never appear in the list and never count toward completed/total.
+
+The workspace task (and its active direct children) can link to repository
+tasks through `task.json.meta.owner-repo` + `meta.local-task`. The link only
+**reports** a coordination-vs-implementation status difference; it never syncs
+or rewrites either side. Missing or invalid mappings produce a localized
+warning without hiding the repository's own task overview.
+
+Configuration outcomes are distinct:
+
+- `packages` missing/empty → plain single-root board (no aggregate view).
+- `packages` declared but unparseable/malformed or every entry rejected →
+  aggregate-degraded view that keeps the workspace task and shows per-entry
+  diagnostics; it never silently falls back to the single-root style.
+- At least one valid package → normal aggregate view; invalid packages are
+  localized diagnostics next to the valid repositories.
+
 ### `/trellis-tasks`
 
 Opens a full, scrollable list of the board in TUI mode (↑/↓ or PgUp/PgDn to
-scroll, `q`/`Esc` to close) with a concise footer fallback elsewhere.
+scroll, `q`/`Esc` to close) with a concise footer fallback elsewhere. In
+aggregate mode it lists the workspace task, the root writable scope, every
+configured repository's non-archived tasks with checklist progress, all
+links/status differences and every diagnostic.
 
 ### Model tool: `trellis_task_board`
 
-- `list` — return the current board without writing.
+- `list` — return the current board without writing. In aggregate mode the
+  output separates the **root writable scope** (the root current task's
+  mutable checkbox list, numbered 1-based) from the **read-only sub-repository
+  lists** (glyphs only, no mutation numbers, so a sub-repository item can never
+  be targeted by `set_completed`).
 - `set_completed` — toggle a single checkbox in `implement.md`
   (`item` = 1-based number, `expectedText` = exact item text, `completed`).
+  It only ever targets the **current Trellis root's current task**; it accepts
+  no repository or task path, so sub-repository aggregate data stays read-only.
 
 `set_completed` is available only for a real checkbox checklist in a trusted
 Trellis task. Legacy numbered plans and planning-state tasks are read-only.
@@ -98,30 +153,41 @@ Trellis task. Legacy numbered plans and planning-state tasks are read-only.
 | `completed` | `已完成 · 阶段 3` |
 | `review` / unknown | localized review label or raw sanitized unknown status, with no invented phase precision |
 
-`!` always means *board data degraded/unreadable* (missing, malformed,
-ambiguous or unsafe files) — never a fabricated task blocker.
+Repository `completed/total` counts task lifecycle status only (non-archived
+tasks); per-task checklist items are never summed into a repository ratio.
+When a checklist has no machine-readable progress the board says
+`进度不可计算` instead of inventing `0/N`. `!` always means *board data
+degraded/unreadable* (missing, malformed, ambiguous or unsafe files) — never a
+fabricated task blocker.
 
 ---
 
 ## Compatibility & security boundary
 
-- **Supported:** Pi CLI 0.84.x, Node.js ≥ 20. The package bundles no runtime
-  dependencies; Pi-owned modules are `peerDependencies` with matching dev copies
+- **Supported:** Pi CLI 0.84.x, Node.js ≥ 20.
+- **Runtime dependency:** `yaml` (used to parse `.trellis/config.yaml`
+  `packages`). Pi-owned modules are `peerDependencies` with matching dev copies
   for standalone type-checking/tests.
 - **Reads:** only trusted Trellis projects. Path containment is realpath-based
   (`node:path.relative`), so traversal, absolute external refs and symlink
-  escapes are rejected.
+  escapes are rejected. Aggregate discovery reads only the declared packages
+  and their `.trellis/tasks/`; it never touches archived tasks or unconfigured
+  directories.
 - **The only write:** one ASCII checkbox marker (`[ ]` ↔ `[x]`) in an existing
-  canonical `implement.md` inside `.trellis/tasks/`. It never creates files and
-  never accepts an arbitrary path. The write re-resolves the session, task and
-  file inside `withFileMutationQueue` and re-validates the item text.
+  canonical `implement.md` inside the **current root's** `.trellis/tasks/`. It
+  never creates files and never accepts an arbitrary path (and no sub-repository
+  path is ever writable). The write re-resolves the session, task and file
+  inside `withFileMutationQueue` and re-validates the item text.
 - **Never modified:** `.trellis/scripts/`, `.trellis/workflow.md`,
   `.pi/extensions/trellis/`, project `.pi/settings.json`, official
-  agents/prompts/skills, or any other Trellis-managed file.
+  agents/prompts/skills, any sub-repository Trellis task, or any other
+  Trellis-managed file.
 - **Session pointer** (`.trellis/.runtime/sessions/`) is local-only and
   gitignored; the board reflects the local dev's current task. If a task is
   started from a plain terminal without `TRELLIS_CONTEXT_ID`, no session file is
-  written and the board shows "no task" — an expected degradation, not a bug.
+  written and the workspace block shows "no task" — an expected degradation,
+  not a bug. With a valid `packages` declaration the repository layer still
+  renders.
 
 > **Security note:** Pi packages execute with full system access. Review the
 > source before installing third-party packages. This package's only system
@@ -138,10 +204,10 @@ npm test
 npm run pack:check        # npm pack --dry-run
 ```
 
-The parser, state loader, key algorithms and width helpers are pure Node and are
-covered by unit tests. `extension`/`task-state` loading and the widget visuals
-are validated in an interactive Pi session (see the widget above and
-`/trellis-tasks`).
+The parser, state loader, aggregate state, key algorithms and width helpers are
+pure Node and are covered by unit tests. `extension`/`task-state` loading and
+the widget visuals are validated in an interactive Pi session (see the widget
+above and `/trellis-tasks`).
 
 ---
 

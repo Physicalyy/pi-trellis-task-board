@@ -21,6 +21,7 @@ import { Type } from "typebox";
 import { formatReason, formatStatus, renderFullListLines, renderWidgetLines, truncateToWidth, type WidgetStyler } from "./ui.ts";
 import { loadSnapshot, type BoardSnapshot, type SessionIdentity } from "./task-state.ts";
 import { setCompleted } from "./mutation.ts";
+import { isAggregate, loadBoard, viewMode, type AggregateBoardSnapshot, type BoardView } from "./aggregate-state.ts";
 
 const WIDGET_KEY = "trellis-task-board";
 const POLL_MS = 10_000;
@@ -55,7 +56,7 @@ function sessionIdentity(ctx: ExtensionContext): SessionIdentity {
 }
 
 export default function trellisTaskBoard(pi: ExtensionAPI): void {
-  let current: BoardSnapshot | null = null;
+  let current: BoardView | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let polling = false;
   let generation = 0;
@@ -67,8 +68,8 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
     }
   }
 
-  function load(ctx: ExtensionContext): BoardSnapshot {
-    return loadSnapshot(ctx.cwd, sessionIdentity(ctx), ctx.isProjectTrusted());
+  function load(ctx: ExtensionContext): BoardView {
+    return loadBoard(ctx.cwd, sessionIdentity(ctx), ctx.isProjectTrusted());
   }
 
   function setBoardWidget(ctx: ExtensionContext): void {
@@ -98,6 +99,15 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
       ctx.ui.setStatus(WIDGET_KEY, undefined);
       return;
     }
+    if (isAggregate(current)) {
+      // Multi-root aggregate mode: the workspace block stays visible even
+      // when the workspace task itself is degraded / has no session, as long
+      // as the packages declaration is explicit. Read-only, never deactivates
+      // the aggregate just because the workspace has no current task.
+      setBoardWidget(ctx);
+      ctx.ui.setStatus(WIDGET_KEY, aggregateSummary(current));
+      return;
+    }
     if (current.degraded) {
       setBoardWidget(ctx);
       ctx.ui.setStatus(WIDGET_KEY, `! ${formatReason(current.reason)}`);
@@ -117,7 +127,10 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
     );
   }
 
-  function snapshotKey(snapshot: BoardSnapshot): string {
+  function snapshotKey(snapshot: BoardView): string {
+    if (isAggregate(snapshot)) {
+      return `agg:${snapshot.fingerprint ?? ""}`;
+    }
     return snapshot.fingerprint ?? JSON.stringify({
       available: snapshot.available,
       degraded: snapshot.degraded,
@@ -129,7 +142,7 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
     });
   }
 
-  function refresh(ctx: ExtensionContext): BoardSnapshot {
+  function refresh(ctx: ExtensionContext): BoardView {
     const snap = load(ctx);
     if (current && snapshotKey(snap) === snapshotKey(current)) return current;
     current = snap;
@@ -144,6 +157,35 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
     if (current.root && ctx.isProjectTrusted()) registerBoardTool();
     render(ctx);
     if (current.root) startPoll(ctx);
+  }
+
+  function aggregateSummary(view: AggregateBoardSnapshot): string {
+    if (view.repositories.length > 0) return `多根聚合 · ${view.repositories.length} 仓库`;
+    return "多根聚合 · 配置异常";
+  }
+
+  /**
+   * The only writable scope for the board: the current Trellis root's current
+   * task checklist. In aggregate mode every sub-repository is read-only and
+   * `set_completed` still resolves this root task only, never a repo path.
+   */
+  function writableScope(view: BoardView): {
+    taskId: string | null;
+    taskPath: string | null;
+    checklistAvailable: boolean;
+    mutableItems: number;
+  } {
+    const snap = isAggregate(view) ? view.workspace : view;
+    const checklist =
+      snap.available && snap.checklist && snap.checklist.mode === "checkbox" && snap.checklist.total > 0
+        ? snap.checklist
+        : null;
+    return {
+      taskId: snap.taskId ?? null,
+      taskPath: snap.taskPath ?? null,
+      checklistAvailable: checklist !== null,
+      mutableItems: checklist ? checklist.items.filter((i) => i.kind === "checkbox").length : 0,
+    };
   }
 
   function startPoll(ctx: ExtensionContext): void {
@@ -203,21 +245,38 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
       async execute(_id, params, _signal, _onUpdate, ctx) {
         const identity = sessionIdentity(ctx);
         const trusted = ctx.isProjectTrusted();
-        const snap = loadSnapshot(ctx.cwd, identity, trusted);
 
         if (params.action === "list") {
-          const text = renderFullListLines(snap).join("\n") || "无 Trellis 任务看板。";
+          const view = loadBoard(ctx.cwd, identity, trusted);
+          const text = renderFullListLines(view).join("\n") || "无 Trellis 任务看板。";
           return {
             content: [{ type: "text", text }],
             details: {
-              available: snap.available,
-              degraded: snap.degraded,
-              reason: snap.reason ?? null,
-              status: snap.statusRaw ?? null,
-              taskId: snap.taskId ?? null,
+              mode: viewMode(view),
+              available: isAggregate(view) ? view.workspace.available : view.available,
+              degraded: isAggregate(view) ? view.workspace.degraded : view.degraded,
+              reason: isAggregate(view) ? (view.workspace.reason ?? null) : (view.reason ?? null),
+              status: isAggregate(view) ? (view.workspace.statusRaw ?? null) : (view.statusRaw ?? null),
+              taskId: isAggregate(view) ? (view.workspace.taskId ?? null) : (view.taskId ?? null),
+              writable: writableScope(view),
+              repositories: isAggregate(view)
+                ? view.repositories.map((r) => ({
+                    packageName: r.packageName,
+                    relativePath: r.relativePath,
+                    root: r.root,
+                    readOnly: true,
+                    counts: r.counts,
+                    warnings: r.warnings,
+                  }))
+                : [],
             },
           };
         }
+
+        // set_completed never accepts a repository or task path; it resolves
+        // the current Trellis root's current task only, so sub-repository
+        // aggregate data stays read-only.
+        const snap = loadSnapshot(ctx.cwd, identity, trusted);
 
         if (!snap.available) {
           return {
@@ -256,7 +315,14 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
       if (!ctx.hasUI) return;
       if (ctx.mode !== "tui") {
         // Concise non-TUI fallback: surface the summary in the footer status.
-        ctx.ui.setStatus(WIDGET_KEY, snap.degraded ? `! ${formatReason(snap.reason)}` : formatStatus(snap));
+        ctx.ui.setStatus(
+          WIDGET_KEY,
+          isAggregate(snap)
+            ? aggregateSummary(snap)
+            : snap.degraded
+              ? `! ${formatReason(snap.reason)}`
+              : formatStatus(snap),
+        );
         return;
       }
       const lines = renderFullListLines(snap, { width: 10_000 });

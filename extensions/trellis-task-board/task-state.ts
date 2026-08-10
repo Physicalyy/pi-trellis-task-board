@@ -130,7 +130,8 @@ export function resolveTaskDir(root: string, ref: string): string | null {
   return join(root, ".trellis", "tasks", normalized);
 }
 
-function canonicalTasksDir(root: string): string | null {
+/** Canonical (realpath) `.trellis/tasks` dir for a Trellis root, or null. */
+export function canonicalTasksDir(root: string): string | null {
   const d = join(root, ".trellis", "tasks");
   if (!existsSync(d)) return null;
   try {
@@ -172,7 +173,8 @@ function soleSessionRef(sessionDir: string): { key: string; ref: string } | null
   return ref ? { key, ref } : null;
 }
 
-function readTaskJson(taskDir: string): Record<string, unknown> | null {
+/** Parse `task.json` in a task dir into a narrowed object, or null. */
+export function readTaskJson(taskDir: string): Record<string, unknown> | null {
   const p = join(taskDir, "task.json");
   if (!existsSync(p)) return null;
   let data: unknown;

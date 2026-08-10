@@ -128,6 +128,41 @@ test("setCompleted rejects a missing implement.md (never creates a file)", async
   rmSync(root, { recursive: true, force: true });
 });
 
+test("setCompleted only writes the current root task, never sub-repository data", async () => {
+  const root = fixtureChecklist();
+  // Configure a sub-repository package whose implement.md must stay untouched.
+  const repo = join(root, "platform", "repo-a");
+  const repoTask = join(repo, ".trellis", "tasks", "08-01-task");
+  mkdirSync(repoTask, { recursive: true });
+  writeFileSync(
+    join(repoTask, "task.json"),
+    JSON.stringify({ id: "08-01-task", title: "Repo Task", status: "in_progress" }),
+    "utf8",
+  );
+  writeFileSync(join(repoTask, "implement.md"), "## Checklist\n\n- [ ] subrepo-alpha\n- [ ] subrepo-bravo\n", "utf8");
+  writeFileSync(
+    join(root, ".trellis", "config.yaml"),
+    "packages:\n  repo-a:\n    path: platform/repo-a\n",
+    "utf8",
+  );
+
+  const res = await setCompleted(root, { sessionId: "s1" }, true, {
+    item: 1,
+    expectedText: "alpha",
+    completed: true,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.changed, true);
+  // Root task implement.md changed.
+  assert.ok(readFileSync(join(root, ".trellis", "tasks", "T1", "implement.md"), "utf8").includes("- [x] alpha"));
+  // Sub-repository implement.md is byte-for-byte untouched.
+  assert.equal(
+    readFileSync(join(repoTask, "implement.md"), "utf8"),
+    "## Checklist\n\n- [ ] subrepo-alpha\n- [ ] subrepo-bravo\n",
+  );
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("setCompleted rejects a task ref escaping .trellis/tasks", async () => {
   const root = fixtureChecklist();
   const sess = join(root, ".trellis", ".runtime", "sessions");
