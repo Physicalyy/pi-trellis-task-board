@@ -17,7 +17,8 @@ import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 
 import { join } from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { applyMarkerChange, normalizeText, parseChecklist } from "./checklist.ts";
-import { isPathInside, loadSnapshot, type SessionIdentity } from "./task-state.ts";
+import { isPathInside, type SessionIdentity } from "./task-state.ts";
+import { loadWritableSnapshot } from "./aggregate-state.ts";
 import { formatReason } from "./ui.ts";
 
 export interface SetCompletedParams {
@@ -46,11 +47,13 @@ export function setCompleted(
   params: SetCompletedParams,
 ): Promise<SetCompletedResult> {
   // Read-only pre-flight: cheap rejection before entering the mutation queue.
-  const snap = loadSnapshot(cwd, identity, trusted);
+  const snap = loadWritableSnapshot(cwd, identity, trusted);
   if (!snap.available) {
-    return Promise.resolve(
-      err(snap.reason === "untrusted" ? "项目不受信任；看板未激活。" : "无当前任务；看板未激活。"),
-    );
+    if (snap.reason === "untrusted") return Promise.resolve(err("项目不受信任；看板未激活。"));
+    if (snap.reason === "ambiguous-active-binding") {
+      return Promise.resolve(err("当前会话在多个 Trellis 根中绑定任务；拒绝猜测或写入。"));
+    }
+    return Promise.resolve(err("当前会话未绑定执行任务；无法修改。"));
   }
   if (snap.degraded) {
     return Promise.resolve(err(`看板异常（${formatReason(snap.reason)}）；请运行 list 获取最新快照。`));
@@ -80,7 +83,7 @@ export function setCompleted(
   }
 
   return withFileMutationQueue(realImpl, async () => {
-    const live = loadSnapshot(cwd, identity, trusted);
+    const live = loadWritableSnapshot(cwd, identity, trusted);
     if (!live.available || !live.taskPath || !live.checklist || live.checklist.mode !== "checkbox") {
       return err("状态已过期；请运行 list 获取最新快照。");
     }

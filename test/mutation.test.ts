@@ -163,6 +163,55 @@ test("setCompleted only writes the current root task, never sub-repository data"
   rmSync(root, { recursive: true, force: true });
 });
 
+test("setCompleted writes a uniquely bound child root but never another discovered root", async () => {
+  const root = fixtureChecklist();
+  // Remove the root binding for this Pi session and leave it as unrelated history.
+  const rootSession = join(root, ".trellis", ".runtime", "sessions");
+  rmSync(join(rootSession, "pi_s1.json"));
+  writeFileSync(join(rootSession, "pi_old.json"), JSON.stringify({ current_task: ".trellis/tasks/T1" }), "utf8");
+
+  const child = join(root, "platform", "repo-a");
+  const childTask = join(child, ".trellis", "tasks", "A");
+  mkdirSync(childTask, { recursive: true });
+  writeFileSync(join(childTask, "task.json"), JSON.stringify({ id: "A", status: "in_progress" }), "utf8");
+  writeFileSync(join(childTask, "implement.md"), "- [ ] child-alpha\n", "utf8");
+  const childSession = join(child, ".trellis", ".runtime", "sessions");
+  mkdirSync(childSession, { recursive: true });
+  writeFileSync(join(childSession, "pi_s1.json"), JSON.stringify({ current_task: ".trellis/tasks/A" }), "utf8");
+
+  const rootBefore = readFileSync(join(root, ".trellis", "tasks", "T1", "implement.md"), "utf8");
+  const result = await setCompleted(child, { sessionId: "s1" }, true, { item: 1, expectedText: "child-alpha", completed: true });
+  assert.equal(result.ok, true);
+  assert.ok(readFileSync(join(childTask, "implement.md"), "utf8").includes("- [x] child-alpha"));
+  assert.equal(readFileSync(join(root, ".trellis", "tasks", "T1", "implement.md"), "utf8"), rootBefore);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("setCompleted rejects unbound and ambiguous multi-root sessions without changing bytes", async () => {
+  const root = fixtureChecklist();
+  const child = join(root, "repo");
+  const childTask = join(child, ".trellis", "tasks", "A");
+  mkdirSync(childTask, { recursive: true });
+  writeFileSync(join(childTask, "task.json"), JSON.stringify({ id: "A", status: "in_progress" }), "utf8");
+  writeFileSync(join(childTask, "implement.md"), "- [ ] child\n", "utf8");
+  const rootFile = join(root, ".trellis", "tasks", "T1", "implement.md");
+  const beforeRoot = readFileSync(rootFile, "utf8");
+  const beforeChild = readFileSync(join(childTask, "implement.md"), "utf8");
+
+  const unbound = await setCompleted(child, { sessionId: "missing" }, true, { item: 1, expectedText: "alpha", completed: true });
+  assert.equal(unbound.ok, false);
+
+  const childSession = join(child, ".trellis", ".runtime", "sessions");
+  mkdirSync(childSession, { recursive: true });
+  writeFileSync(join(childSession, "pi_s1.json"), JSON.stringify({ current_task: ".trellis/tasks/A" }), "utf8");
+  const ambiguous = await setCompleted(child, { sessionId: "s1" }, true, { item: 1, expectedText: "alpha", completed: true });
+  assert.equal(ambiguous.ok, false);
+  assert.match(ambiguous.message, /多个|拒绝/);
+  assert.equal(readFileSync(rootFile, "utf8"), beforeRoot);
+  assert.equal(readFileSync(join(childTask, "implement.md"), "utf8"), beforeChild);
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("setCompleted rejects a task ref escaping .trellis/tasks", async () => {
   const root = fixtureChecklist();
   const sess = join(root, ".trellis", ".runtime", "sessions");

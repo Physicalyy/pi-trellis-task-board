@@ -11,8 +11,12 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   buildWorkspaceLinks,
+  discoverNestedTrellisRoots,
+  discoverOwnerRepositories,
   isAggregate,
   loadBoard,
+  loadWritableSnapshot,
+  mergeRepositorySources,
   parseConfigState,
   readRepositorySnapshot,
   sortRepositories,
@@ -103,6 +107,26 @@ test("parseConfigState: empty packages map is unconfigured", () => {
   writeConfig(root, "packages: {}\n");
   assert.equal(parseConfigState(root).kind, "unconfigured");
   cleanup(root);
+});
+
+test("parseConfigState: config.yaml symlink escape is rejected", () => {
+  const root = tmpRoot();
+  const outside = mkdtempSync(join(tmpdir(), "ttb-config-out-"));
+  const outsideConfig = join(outside, "config.yaml");
+  writeFileSync(outsideConfig, "packages: {}\n", "utf8");
+  let linked = false;
+  try {
+    symlinkSync(outsideConfig, join(root, ".trellis", "config.yaml"), "file");
+    linked = true;
+  } catch {
+    /* symlinks unsupported */
+  }
+  if (linked) {
+    const state = parseConfigState(root);
+    assert.equal(state.kind, "invalid");
+    if (state.kind === "invalid") assert.ok(state.diagnostics.some((diagnostic) => diagnostic.code === "config-path-unsafe"));
+  }
+  cleanup(root, outside);
 });
 
 test("parseConfigState: unparseable YAML is invalid with a diagnostic", () => {
@@ -314,6 +338,27 @@ test("readRepositorySnapshot: checklist modes checkbox/legacy/none", () => {
   cleanup(root);
 });
 
+test("readRepositorySnapshot: implement.md symlink escape is not parsed", () => {
+  const root = tmpRoot();
+  const repo = makeRepo(root, "platform/repo-a");
+  const taskDir = writeRepoTask(repo, "t-cb", "in_progress");
+  const outside = mkdtempSync(join(tmpdir(), "ttb-implement-out-"));
+  const outsideImplement = join(outside, "implement.md");
+  writeFileSync(outsideImplement, "- [ ] escaped\n", "utf8");
+  let linked = false;
+  try {
+    symlinkSync(outsideImplement, join(taskDir, "implement.md"), "file");
+    linked = true;
+  } catch {
+    /* symlinks unsupported */
+  }
+  if (linked) {
+    const snapshot = readRepositorySnapshot(configuredPkg(root, "a", "platform/repo-a"));
+    assert.equal(snapshot.tasks[0].checklist, null);
+  }
+  cleanup(root, outside);
+});
+
 test("readRepositorySnapshot: planning tasks never parse a checklist", () => {
   const root = tmpRoot();
   const repo = makeRepo(root, "platform/repo-a");
@@ -406,6 +451,68 @@ test("sortRepositories: in-progress repos come first, config order kept within",
   assert.deepEqual(sorted.map((r) => r.packageName), ["a-repo", "z-repo", "m-repo"]);
 });
 
+// ── Automatic discovery ─────────────────────────────────────────────────
+
+test("discoverNestedTrellisRoots finds nested roots without packages and skips management/build dirs", () => {
+  const root = tmpRoot();
+  const repoA = makeRepo(root, "platform/repo-a");
+  const repoB = makeRepo(root, "services/repo-b");
+  makeRepo(root, "node_modules/ignored");
+  makeRepo(root, "dist/ignored");
+  const result = discoverNestedTrellisRoots(root);
+  assert.deepEqual(result.packages.map((pkg) => pkg.realPath).sort(), [repoA, repoB].sort());
+  assert.equal(result.packages.some((pkg) => pkg.rawPath.includes("ignored")), false);
+  cleanup(root);
+});
+
+test("discoverNestedTrellisRoots reports budget exhaustion and does not traverse outside symlinks", () => {
+  const root = tmpRoot();
+  const outside = tmpRoot();
+  for (let index = 0; index < 8; index++) mkdirSync(join(root, `dir-${index}`), { recursive: true });
+  const link = join(root, "external-link");
+  let linked = false;
+  try { symlinkSync(outside, link, "dir"); linked = true; } catch { /* unsupported */ }
+  const result = discoverNestedTrellisRoots(root, { maxDirectories: 2, maxDepth: 8 });
+  assert.ok(result.diagnostics.some((warning) => warning.code === "discovery-budget"));
+  if (linked) assert.ok(result.diagnostics.some((warning) => warning.code === "discovery-symlink-escape"));
+  assert.equal(result.packages.some((pkg) => pkg.realPath === outside), false);
+  cleanup(root, outside);
+});
+
+test("mergeRepositorySources preserves explicit package name and realpath-deduplicates", () => {
+  const explicit: PackageConfig = { name: "friendly", rawPath: "repo", path: "/ws/repo", realPath: "/ws/repo", source: "package" };
+  const discovered: PackageConfig = { name: "repo", rawPath: "repo", path: "/ws/repo", realPath: "/ws/repo", source: "discovered" };
+  const merged = mergeRepositorySources([explicit], [], [discovered]);
+  assert.equal(merged.packages.length, 1);
+  assert.equal(merged.packages[0].name, "friendly");
+  assert.equal(merged.packages[0].source, "package");
+});
+
+test("discoverOwnerRepositories rejects a task directory symlink escape and keeps safe tasks", () => {
+  const root = tmpRoot();
+  const repo = makeRepo(root, "platform/repo-a");
+  writeTask(root, "WS", "in_progress", { meta: { "owner-repo": "platform/repo-a" } });
+  const outside = tmpRoot();
+  mkdirSync(join(outside, ".trellis", "tasks"), { recursive: true });
+  const escaped = join(outside, "escaped-task");
+  mkdirSync(escaped, { recursive: true });
+  writeFileSync(join(escaped, "task.json"), JSON.stringify({ id: "EVIL", status: "in_progress", meta: { "owner-repo": "platform/repo-a" } }), "utf8");
+  let linked = false;
+  try {
+    symlinkSync(escaped, join(root, ".trellis", "tasks", "escaped"), "dir");
+    linked = true;
+  } catch {
+    /* symlinks unsupported */
+  }
+  if (linked) {
+    const result = discoverOwnerRepositories(root);
+    assert.equal(result.packages.length, 1);
+    assert.equal(result.packages[0].realPath, repo);
+    assert.ok(result.diagnostics.some((diagnostic) => diagnostic.code === "owner-task-escape"));
+  }
+  cleanup(root, outside);
+});
+
 // ── Aggregate board loading ─────────────────────────────────────────────
 
 test("loadBoard: unconfigured root returns the plain single-root snapshot", () => {
@@ -436,6 +543,63 @@ test("loadBoard: untrusted and non-Trellis stay quietly inactive", () => {
   assert.equal(nt.available, false);
   assert.equal(nt.reason, "not-trellis");
   cleanup(root, nonTrellis);
+});
+
+test("loadBoard: no packages automatically aggregates nested roots from root, child and business cwd", () => {
+  const root = tmpRoot();
+  const repoA = makeRepo(root, "platform/repo-a");
+  const repoB = makeRepo(root, "services/repo-b");
+  writeRepoTask(repoA, "A", "in_progress", { implement: "- [ ] a\n" });
+  writeRepoTask(repoB, "B", "planning");
+  const business = join(repoA, "src", "feature");
+  mkdirSync(business, { recursive: true });
+  for (const cwd of [root, repoA, business]) {
+    const view = loadBoard(cwd, { sessionId: "fresh" }, true);
+    assert.equal(isAggregate(view), true);
+    if (!isAggregate(view)) continue;
+    assert.equal(view.root, root);
+    assert.equal(view.cwdRoot, cwd === root ? root : repoA);
+    assert.deepEqual(view.repositories.map((repo) => repo.root).sort(), [repoA, repoB].sort());
+    assert.equal(view.activeBinding?.kind, "unbound");
+  }
+  cleanup(root);
+});
+
+test("loadBoard: unique child session binding is separate from workspace lifecycle", () => {
+  const root = tmpRoot();
+  const repo = makeRepo(root, "platform/repo-a");
+  writeRepoTask(repo, "A", "in_progress", { implement: "- [ ] child item\n" });
+  writeTask(root, "WS", "in_progress", { implement: "- [ ] workspace item\n" });
+  writeSession(root, "pi_old", ".trellis/tasks/WS");
+  writeSession(repo, "pi_s1", ".trellis/tasks/A");
+  const view = loadBoard(join(repo, "src"), { sessionId: "s1" }, true);
+  assert.equal(isAggregate(view), true);
+  if (!isAggregate(view)) return;
+  assert.equal(view.workspace.available, false, "old root session must not impersonate current session");
+  assert.equal(view.activeBinding?.kind, "bound");
+  if (view.activeBinding?.kind === "bound") {
+    assert.equal(view.activeBinding.snapshot.taskId, "A");
+    assert.equal(view.activeBinding.repository?.root, repo);
+  }
+  cleanup(root);
+});
+
+test("loadBoard: same identity bound in multiple roots is ambiguous and writable resolution fails closed", () => {
+  const root = tmpRoot();
+  const repo = makeRepo(root, "platform/repo-a");
+  writeTask(root, "WS", "in_progress", { implement: "- [ ] root\n" });
+  writeRepoTask(repo, "A", "in_progress", { implement: "- [ ] child\n" });
+  writeSession(root, "pi_s1", ".trellis/tasks/WS");
+  writeSession(repo, "pi_s1", ".trellis/tasks/A");
+  const view = loadBoard(repo, { sessionId: "s1" }, true);
+  assert.equal(isAggregate(view), true);
+  if (!isAggregate(view)) return;
+  assert.equal(view.activeBinding?.kind, "ambiguous");
+  assert.ok(view.warnings.some((warning) => warning.code === "active-binding-ambiguous"));
+  const writable = loadWritableSnapshot(repo, { sessionId: "s1" }, true);
+  assert.equal(writable.available, false);
+  assert.equal(writable.reason, "ambiguous-active-binding");
+  cleanup(root);
 });
 
 test("loadBoard: aggregates two valid packages with workspace current task", () => {
@@ -501,6 +665,35 @@ test("loadBoard: one invalid package does not hide valid repositories", () => {
   assert.equal(view.configState.kind, "configured");
   assert.equal(view.repositories.length, 1);
   assert.ok(view.warnings.some((w) => w.code === "package-path-missing"));
+  cleanup(root);
+});
+
+test("aggregate fingerprint changes when discovered repository set changes", () => {
+  const root = tmpRoot();
+  const v1 = loadBoard(root, { sessionId: "s1" }, true);
+  const repo = makeRepo(root, "platform/repo-a");
+  writeRepoTask(repo, "A", "planning");
+  const v2 = loadBoard(root, { sessionId: "s1" }, true);
+  assert.equal(isAggregate(v1), false);
+  assert.equal(isAggregate(v2), true);
+  if (isAggregate(v2)) assert.equal(v2.repositories.some((repository) => repository.root === repo), true);
+  cleanup(root);
+});
+
+test("aggregate fingerprint changes when an explicit session binding changes", () => {
+  const root = tmpRoot();
+  const repo = makeRepo(root, "platform/repo-a");
+  writeRepoTask(repo, "A", "in_progress", { implement: "- [ ] a\n" });
+  const v1 = loadBoard(root, { sessionId: "s1" }, true);
+  writeSession(repo, "pi_s1", ".trellis/tasks/A");
+  const v2 = loadBoard(root, { sessionId: "s1" }, true);
+  assert.equal(isAggregate(v1), true);
+  assert.equal(isAggregate(v2), true);
+  if (isAggregate(v1) && isAggregate(v2)) {
+    assert.equal(v1.activeBinding?.kind, "unbound");
+    assert.equal(v2.activeBinding?.kind, "bound");
+    assert.notEqual(v1.fingerprint, v2.fingerprint);
+  }
   cleanup(root);
 });
 

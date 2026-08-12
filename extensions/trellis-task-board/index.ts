@@ -19,9 +19,9 @@ import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { formatReason, formatStatus, renderFullListLines, renderWidgetLines, truncateToWidth, type WidgetStyler } from "./ui.ts";
-import { loadSnapshot, type BoardSnapshot, type SessionIdentity } from "./task-state.ts";
+import { type BoardSnapshot, type SessionIdentity } from "./task-state.ts";
 import { setCompleted } from "./mutation.ts";
-import { isAggregate, loadBoard, viewMode, type AggregateBoardSnapshot, type BoardView } from "./aggregate-state.ts";
+import { isAggregate, loadBoard, loadWritableSnapshot, viewMode, type AggregateBoardSnapshot, type BoardView } from "./aggregate-state.ts";
 
 const WIDGET_KEY = "trellis-task-board";
 const POLL_MS = 10_000;
@@ -75,16 +75,17 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
   function setBoardWidget(ctx: ExtensionContext): void {
     ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
       render(width: number): string[] {
-        // Completed rows are dimmed + struck through, the current row is
-        // highlighted, future rows stay plain. Width safety is preserved
-        // because renderWidgetLines truncates the plain text before styling;
-        // the theme only wraps the already-bounded content.
+        // Renderers budget plain semantic segments before theme styling.
         const style: WidgetStyler = {
           dim: (t) => theme.fg("dim", t),
           strike: (t) => theme.strikethrough(t),
           highlight: (t) => theme.bold(theme.fg("accent", t)),
           accent: (t) => theme.fg("accent", t),
+          text: (t) => theme.fg("text", t),
+          muted: (t) => theme.fg("muted", t),
+          bold: (t) => theme.bold(t),
           warning: (t) => theme.fg("warning", t),
+          error: (t) => theme.fg("error", t),
         };
         return current ? renderWidgetLines(current, { width, style }) : [];
       },
@@ -162,14 +163,15 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
   }
 
   function aggregateSummary(view: AggregateBoardSnapshot): string {
-    if (view.repositories.length > 0) return `多根聚合 · ${view.repositories.length} 仓库`;
-    return "多根聚合 · 配置异常";
+    const binding = view.activeBinding?.kind ?? (view.workspace.available ? "bound" : "unbound");
+    const bindingText = binding === "bound" ? "已绑定" : binding === "ambiguous" ? "绑定歧义" : "未绑定";
+    return `工作区聚合 · ${view.repositories.length} 仓库 · ${bindingText}`;
   }
 
   /**
-   * The only writable scope for the board: the current Trellis root's current
-   * task checklist. In aggregate mode every sub-repository is read-only and
-   * `set_completed` still resolves this root task only, never a repo path.
+   * The only writable scope is the task uniquely bound to the current Pi
+   * session across all discovered roots. Repository overview rows remain
+   * read-only; callers cannot provide a root, task, or filesystem path.
    */
   function writableScope(view: BoardView): {
     taskId: string | null;
@@ -177,7 +179,11 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
     checklistAvailable: boolean;
     mutableItems: number;
   } {
-    const snap = isAggregate(view) ? view.workspace : view;
+    const snap = isAggregate(view)
+      ? view.activeBinding?.kind === "bound"
+        ? view.activeBinding.snapshot
+        : { available: false, degraded: view.activeBinding?.kind === "ambiguous" }
+      : view;
     const checklist =
       snap.available && snap.checklist && snap.checklist.mode === "checkbox" && snap.checklist.total > 0
         ? snap.checklist
@@ -250,16 +256,22 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
 
         if (params.action === "list") {
           const view = loadBoard(ctx.cwd, identity, trusted);
+          const writableSnapshot = loadWritableSnapshot(ctx.cwd, identity, trusted);
           const text = renderFullListLines(view).join("\n") || "无 Trellis 任务看板。";
           return {
             content: [{ type: "text", text }],
             details: {
               mode: viewMode(view),
-              available: isAggregate(view) ? view.workspace.available : view.available,
-              degraded: isAggregate(view) ? view.workspace.degraded : view.degraded,
-              reason: isAggregate(view) ? (view.workspace.reason ?? null) : (view.reason ?? null),
-              status: isAggregate(view) ? (view.workspace.statusRaw ?? null) : (view.statusRaw ?? null),
-              taskId: isAggregate(view) ? (view.workspace.taskId ?? null) : (view.taskId ?? null),
+              available: isAggregate(view) ? view.activeBinding?.kind === "bound" : view.available,
+              degraded: isAggregate(view) ? view.activeBinding?.kind === "ambiguous" : view.degraded,
+              reason: isAggregate(view)
+                ? view.activeBinding?.kind === "ambiguous" ? "ambiguous-active-binding" : view.activeBinding?.kind === "unbound" ? "no-session" : null
+                : (view.reason ?? null),
+              status: writableSnapshot.statusRaw ?? null,
+              taskId: writableSnapshot.taskId ?? null,
+              activeBinding: isAggregate(view) ? view.activeBinding?.kind ?? "unbound" : view.available ? "bound" : "unbound",
+              workspaceRoot: isAggregate(view) ? view.root : view.root ?? null,
+              cwdRoot: isAggregate(view) ? view.cwdRoot ?? null : view.root ?? null,
               writable: writableScope(view),
               repositories: isAggregate(view)
                 ? view.repositories.map((r) => ({
@@ -275,10 +287,10 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
           };
         }
 
-        // set_completed never accepts a repository or task path; it resolves
-        // the current Trellis root's current task only, so sub-repository
-        // aggregate data stays read-only.
-        const snap = loadSnapshot(ctx.cwd, identity, trusted);
+        // set_completed never accepts a repository or task path. It resolves
+        // the unique current-session binding across discovered roots, while
+        // every repository overview row stays read-only.
+        const snap = loadWritableSnapshot(ctx.cwd, identity, trusted);
 
         if (!snap.available) {
           return {
@@ -288,7 +300,9 @@ export default function trellisTaskBoard(pi: ExtensionAPI): void {
                 text:
                   snap.reason === "untrusted"
                     ? "看板未激活：项目不受信任。"
-                    : "看板未激活：无当前 Trellis 任务。",
+                    : snap.reason === "ambiguous-active-binding"
+                      ? "当前会话在多个 Trellis 根中绑定任务；拒绝猜测或写入。"
+                      : "当前会话未绑定执行任务；无法修改。",
               },
             ],
             details: { ok: false },

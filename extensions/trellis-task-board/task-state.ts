@@ -2,12 +2,6 @@
  * Trusted Trellis project discovery, session-key compatibility, current-task
  * resolution and canonical path containment.
  *
- * This module is pure Node (fs / crypto / path only) so it can be unit-tested
- * standalone. It never imports private code from the project's managed Pi
- * Trellis extension; it re-implements the two known session-key algorithms
- * (the current Pi extension writer and the Python runtime normalizer) and
- * reads only the runtime session files and the task files they point at.
- *
  * Everything here is read-only. The single write boundary lives in mutation.ts.
  */
 
@@ -22,7 +16,7 @@ export interface SessionIdentity {
 }
 
 export interface BoardSnapshot {
-  /** A trusted Trellis project with a uniquely resolvable current task. */
+  /** A trusted Trellis root with a uniquely resolvable current task. */
   available: boolean;
   /** Board data missing, malformed, ambiguous or unsafe. Not a task blocker. */
   degraded: boolean;
@@ -52,56 +46,70 @@ export function sanitizeKey(raw: string): string {
   return safe.slice(0, 160);
 }
 
-/**
- * Ordered session-key candidates for the current Pi session.
- * Primary: the current Pi extension writer's `contextKey()` algorithm.
- * Secondary: the Python `active_task.py` normalized candidate (version tolerance).
- * All candidates are deduplicated preserving priority order.
- */
+/** Ordered, deduplicated session-key candidates for the current Pi session. */
 export function resolveContextKeys(id: SessionIdentity): string[] {
   const keys: string[] = [];
   const sessionId = id.sessionId ? id.sessionId.trim() : "";
   if (sessionId) {
     const normalized = sessionId.replace(/[^A-Za-z0-9._-]+/g, "_");
-    if (!normalized) {
-      keys.push(`pi_${hash(sessionId)}`);
-    } else {
-      keys.push(`pi_${normalized}${normalized === sessionId ? "" : `_${hash(sessionId)}`}`);
-    }
+    if (!normalized) keys.push(`pi_${hash(sessionId)}`);
+    else keys.push(`pi_${normalized}${normalized === sessionId ? "" : `_${hash(sessionId)}`}`);
     const safe = sanitizeKey(sessionId);
     keys.push(safe ? `pi_${safe}` : `pi_${hash(sessionId)}`);
   }
   const transcriptPath = id.transcriptPath ? id.transcriptPath.trim() : "";
-  if (transcriptPath) {
-    keys.push(`pi_transcript_${hash(transcriptPath)}`);
-  }
+  if (transcriptPath) keys.push(`pi_transcript_${hash(transcriptPath)}`);
   return [...new Set(keys)];
 }
 
-/** Walk upward from cwd to the nearest ancestor containing a `.trellis/` directory. */
-export function findTrellisRoot(cwd: string): string | null {
+function hasTrellisDirectory(candidate: string): boolean {
+  const dot = join(candidate, ".trellis");
+  try {
+    return existsSync(dot) && statSync(dot).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Collect every Trellis root on cwd's ancestor chain, nearest first. Roots are
+ * canonicalized and deduplicated; unrelated siblings are never considered.
+ */
+export function findTrellisRoots(cwd: string): string[] {
   let cur = resolve(cwd);
-  let guard = 0;
-  for (;;) {
-    const dot = join(cur, ".trellis");
-    if (existsSync(dot)) {
+  try {
+    // Canonicalize cwd before walking parents so a cwd reached through a
+    // directory symlink cannot inherit the symlink's unrelated lexical parent.
+    cur = realpathSync(cur);
+  } catch {
+    // A missing cwd simply produces no Trellis root below.
+  }
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (let guard = 0; guard <= 1000; guard++) {
+    if (hasTrellisDirectory(cur)) {
+      let canonical = cur;
       try {
-        if (statSync(dot).isDirectory()) {
-          try {
-            return realpathSync(cur);
-          } catch {
-            return cur;
-          }
-        }
+        canonical = realpathSync(cur);
       } catch {
-        /* fall through to parent */
+        // Keep the resolved ancestor only as a degraded-state anchor. Later
+        // canonical boundary checks still fail closed.
+      }
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        roots.push(canonical);
       }
     }
     const parent = dirname(cur);
-    if (parent === cur || guard > 1000) return null;
+    if (parent === cur) break;
     cur = parent;
-    guard++;
   }
+  return roots;
+}
+
+/** Walk upward from cwd to the nearest ancestor containing `.trellis/`. */
+export function findTrellisRoot(cwd: string): string | null {
+  return findTrellisRoots(cwd)[0] ?? null;
 }
 
 /** Canonical containment check using path-relative semantics, not string prefixes. */
@@ -130,156 +138,209 @@ export function resolveTaskDir(root: string, ref: string): string | null {
   return join(root, ".trellis", "tasks", normalized);
 }
 
-/** Canonical (realpath) `.trellis/tasks` dir for a Trellis root, or null. */
+/** Canonical, contained `.trellis/tasks` dir for a Trellis root, or null. */
 export function canonicalTasksDir(root: string): string | null {
-  const d = join(root, ".trellis", "tasks");
-  if (!existsSync(d)) return null;
   try {
-    if (!statSync(d).isDirectory()) return null;
-    return realpathSync(d);
+    const canonicalRoot = realpathSync(root);
+    const dot = realpathSync(join(canonicalRoot, ".trellis"));
+    if (!statSync(dot).isDirectory() || !isPathInside(canonicalRoot, dot)) return null;
+    const tasks = realpathSync(join(dot, "tasks"));
+    if (!statSync(tasks).isDirectory() || !isPathInside(dot, tasks)) return null;
+    return tasks;
   } catch {
     return null;
   }
 }
 
 function readRuntimeRef(sessionDir: string, key: string): string | null {
-  const p = join(sessionDir, `${key}.json`);
-  if (!existsSync(p)) return null;
+  const candidate = join(sessionDir, `${key}.json`);
+  let sessionFile: string;
   let data: unknown;
   try {
-    data = JSON.parse(readFileSync(p, "utf8"));
+    sessionFile = realpathSync(candidate);
+    if (!isPathInside(sessionDir, sessionFile) || !statSync(sessionFile).isFile()) return null;
+    data = JSON.parse(readFileSync(sessionFile, "utf8"));
   } catch {
     return null;
   }
-  if (!data || typeof data !== "object") return null;
-  const rec = data as Record<string, unknown>;
-  const ref = typeof rec.current_task === "string" ? rec.current_task.trim() : "";
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const ref = typeof (data as Record<string, unknown>).current_task === "string"
+    ? ((data as Record<string, unknown>).current_task as string).trim()
+    : "";
   return ref || null;
 }
 
 function soleSessionRef(sessionDir: string): { key: string; ref: string } | null {
-  if (!existsSync(sessionDir)) return null;
-  let entries: string[];
   try {
-    if (!statSync(sessionDir).isDirectory()) return null;
-    entries = readdirSync(sessionDir);
+    if (!existsSync(sessionDir) || !statSync(sessionDir).isDirectory()) return null;
+    const sessionFiles = readdirSync(sessionDir).filter((file) => file.endsWith(".json"));
+    if (sessionFiles.length !== 1) return null;
+    const key = sessionFiles[0].slice(0, -".json".length);
+    const ref = readRuntimeRef(sessionDir, key);
+    return ref ? { key, ref } : null;
   } catch {
     return null;
   }
-  const sessionFiles = entries.filter((f) => f.endsWith(".json"));
-  if (sessionFiles.length !== 1) return null;
-  const key = sessionFiles[0].slice(0, -".json".length);
-  const ref = readRuntimeRef(sessionDir, key);
-  return ref ? { key, ref } : null;
 }
 
 /** Parse `task.json` in a task dir into a narrowed object, or null. */
 export function readTaskJson(taskDir: string): Record<string, unknown> | null {
-  const p = join(taskDir, "task.json");
-  if (!existsSync(p)) return null;
   let data: unknown;
   try {
-    if (!statSync(p).isFile()) return null;
-    data = JSON.parse(readFileSync(p, "utf8"));
+    const canonicalTaskDir = realpathSync(taskDir);
+    const taskJson = realpathSync(join(canonicalTaskDir, "task.json"));
+    if (!isPathInside(canonicalTaskDir, taskJson) || !statSync(taskJson).isFile()) return null;
+    data = JSON.parse(readFileSync(taskJson, "utf8"));
   } catch {
     return null;
   }
-  return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+  return data && typeof data === "object" && !Array.isArray(data)
+    ? (data as Record<string, unknown>)
+    : null;
 }
 
-function computeFingerprint(s: BoardSnapshot, identity: SessionIdentity): string {
-  const items =
-    s.checklist?.items.map((i) => `${i.line}:${i.checked ? "x" : " "}:${i.normalized}`) ?? [];
+function pathSignature(path: string): string {
+  try {
+    const stat = statSync(path);
+    return `${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return "missing";
+  }
+}
+
+function sessionDirectorySignature(root: string): string {
+  try {
+    const dotTrellis = realpathSync(join(root, ".trellis"));
+    if (!isPathInside(root, dotTrellis)) return "unsafe";
+    const sessionDir = realpathSync(join(dotTrellis, ".runtime", "sessions"));
+    if (!isPathInside(dotTrellis, sessionDir) || !statSync(sessionDir).isDirectory()) return "unsafe";
+    return readdirSync(sessionDir)
+      .filter((file) => file.endsWith(".json"))
+      .sort()
+      .map((file) => {
+        try {
+          const sessionFile = realpathSync(join(sessionDir, file));
+          return `${file}:${isPathInside(sessionDir, sessionFile) ? pathSignature(sessionFile) : "unsafe"}`;
+        } catch {
+          return `${file}:unreadable`;
+        }
+      })
+      .join(",");
+  } catch {
+    return "missing";
+  }
+}
+
+function computeFingerprint(snapshot: BoardSnapshot, identity: SessionIdentity): string {
+  const items = snapshot.checklist?.items.map(
+    (item) => `${item.line}:${item.checked ? "x" : " "}:${item.normalized}`,
+  ) ?? [];
   const materialFiles = ["prd.md", "design.md", "implement.md", "implement.jsonl", "check.jsonl"].map((name) => {
-    const path = s.taskPath ? join(s.taskPath, name) : "";
-    if (!path || !existsSync(path)) return `${name}:missing`;
-    try {
-      const stat = statSync(path);
-      return `${name}:${stat.size}:${stat.mtimeMs}`;
-    } catch {
-      return `${name}:unreadable`;
-    }
+    const path = snapshot.taskPath ? join(snapshot.taskPath, name) : "";
+    return `${name}:${path ? pathSignature(path) : "missing"}`;
   });
-  const repr = JSON.stringify({
-    root: s.root,
+  return hash(JSON.stringify({
+    root: snapshot.root,
     sessionId: identity.sessionId || null,
-    contextKey: s.contextKey || null,
-    taskPath: s.taskPath,
-    statusRaw: s.statusRaw,
-    planning: s.planning,
+    transcriptPath: identity.transcriptPath || null,
+    sessions: snapshot.root ? sessionDirectorySignature(snapshot.root) : "missing",
+    contextKey: snapshot.contextKey || null,
+    taskPath: snapshot.taskPath,
+    statusRaw: snapshot.statusRaw,
+    planning: snapshot.planning,
+    reason: snapshot.reason,
     items,
     materialFiles,
-  });
-  return hash(repr);
+  }));
+}
+
+function finish(snapshot: BoardSnapshot, identity: SessionIdentity): BoardSnapshot {
+  snapshot.fingerprint = computeFingerprint(snapshot, identity);
+  return snapshot;
 }
 
 /**
- * Load the current Trellis board snapshot for a session.
- *
- * - Untrusted projects and non-Trellis dirs deactivate quietly.
- * - Candidate keys are tried in priority order; zero candidates fall back to
- *   Trellis's sole-session semantics; multiple sessions are never guessed.
- * - The task directory must resolve, as a realpath, inside `.trellis/tasks`.
+ * Load a board snapshot from one explicit Trellis root. No ancestor selection
+ * occurs here, allowing aggregate state to resolve the same Pi identity across
+ * every discovered root without changing the single-root compatibility API.
  */
-export function loadSnapshot(cwd: string, identity: SessionIdentity, trusted: boolean): BoardSnapshot {
-  if (!trusted) {
-    return { available: false, degraded: false, reason: "untrusted" };
+export function loadSnapshotAtRoot(
+  rootInput: string,
+  identity: SessionIdentity,
+  trusted: boolean,
+  options: { allowSoleSessionFallback?: boolean } = {},
+): BoardSnapshot {
+  if (!trusted) return { available: false, degraded: false, reason: "untrusted" };
+
+  let root: string;
+  try {
+    root = realpathSync(rootInput);
+  } catch {
+    return finish({ available: false, degraded: true, reason: "not-trellis", root: resolve(rootInput) }, identity);
   }
-  const root = findTrellisRoot(cwd);
-  if (!root) {
-    return { available: false, degraded: false, reason: "not-trellis" };
+  if (!hasTrellisDirectory(root)) {
+    return finish({ available: false, degraded: false, reason: "not-trellis", root }, identity);
   }
   const tasksDir = canonicalTasksDir(root);
-  if (!tasksDir) {
-    return { available: false, degraded: true, reason: "no-tasks-dir", root };
-  }
+  if (!tasksDir) return finish({ available: false, degraded: true, reason: "no-tasks-dir", root }, identity);
 
-  const sessionDir = join(root, ".trellis", ".runtime", "sessions");
-  let resolved: { key: string; ref: string } | null = null;
+  let sessionDir = join(root, ".trellis", ".runtime", "sessions");
+  if (existsSync(sessionDir)) {
+    try {
+      const dotTrellis = realpathSync(join(root, ".trellis"));
+      sessionDir = realpathSync(sessionDir);
+      if (!isPathInside(dotTrellis, sessionDir) || !statSync(sessionDir).isDirectory()) {
+        return finish({ available: false, degraded: true, reason: "session-outside-root", root }, identity);
+      }
+    } catch {
+      return finish({ available: false, degraded: true, reason: "session-outside-root", root }, identity);
+    }
+  }
+  let resolvedSession: { key: string; ref: string } | null = null;
   let sourceType: "session" | "session-fallback" = "session";
   for (const key of resolveContextKeys(identity)) {
     const ref = readRuntimeRef(sessionDir, key);
     if (ref) {
-      resolved = { key, ref };
+      resolvedSession = { key, ref };
       break;
     }
   }
-  if (!resolved) {
-    const fb = soleSessionRef(sessionDir);
-    if (fb) {
-      resolved = fb;
+  if (!resolvedSession && options.allowSoleSessionFallback !== false) {
+    const fallback = soleSessionRef(sessionDir);
+    if (fallback) {
+      resolvedSession = fallback;
       sourceType = "session-fallback";
     }
   }
-  if (!resolved) {
-    return { available: false, degraded: true, reason: "no-session", root };
+  if (!resolvedSession) {
+    return finish({ available: false, degraded: true, reason: "no-session", root }, identity);
   }
 
-  const candidate = resolveTaskDir(root, resolved.ref);
+  const candidate = resolveTaskDir(root, resolvedSession.ref);
   if (!candidate) {
-    return { available: false, degraded: true, reason: "bad-task-ref", root, contextKey: resolved.key };
+    return finish({ available: false, degraded: true, reason: "bad-task-ref", root, contextKey: resolvedSession.key }, identity);
   }
 
-  let realTaskDir: string;
+  let taskPath: string;
   try {
-    realTaskDir = realpathSync(candidate);
+    taskPath = realpathSync(candidate);
   } catch {
-    return { available: false, degraded: true, reason: "missing-task-dir", root, contextKey: resolved.key };
+    return finish({ available: false, degraded: true, reason: "missing-task-dir", root, contextKey: resolvedSession.key }, identity);
   }
-  if (!isPathInside(tasksDir, realTaskDir)) {
-    return { available: false, degraded: true, reason: "task-outside-tasks", root, contextKey: resolved.key };
+  if (!isPathInside(tasksDir, taskPath)) {
+    return finish({ available: false, degraded: true, reason: "task-outside-tasks", root, contextKey: resolvedSession.key }, identity);
   }
 
-  const taskData = readTaskJson(realTaskDir);
+  const taskData = readTaskJson(taskPath);
   if (!taskData) {
-    return {
+    return finish({
       available: false,
       degraded: true,
-      reason: taskData === null && !existsSync(join(realTaskDir, "task.json")) ? "missing-task-json" : "bad-task-json",
+      reason: existsSync(join(taskPath, "task.json")) ? "bad-task-json" : "missing-task-json",
       root,
-      contextKey: resolved.key,
-      taskPath: realTaskDir,
-    };
+      contextKey: resolvedSession.key,
+      taskPath,
+    }, identity);
   }
 
   const statusRaw = typeof taskData.status === "string" ? taskData.status : "";
@@ -288,36 +349,42 @@ export function loadSnapshot(cwd: string, identity: SessionIdentity, trusted: bo
     (typeof taskData.name === "string" && taskData.name) ||
     (typeof taskData.id === "string" && taskData.id) ||
     "";
-  const taskId = typeof taskData.id === "string" ? taskData.id : realTaskDir.split(/[\\/]/).pop() || "";
-
+  const taskId = typeof taskData.id === "string" ? taskData.id : taskPath.split(/[\\/]/).pop() || "";
   const planning = statusRaw === "planning";
   let checklist: ChecklistParseResult | null = null;
   if (!planning) {
-    const implPath = join(realTaskDir, "implement.md");
-    if (existsSync(implPath)) {
-      try {
-        if (statSync(implPath).isFile()) {
-          checklist = parseChecklist(readFileSync(implPath, "utf8"));
+    const implementPath = join(taskPath, "implement.md");
+    try {
+      if (existsSync(implementPath)) {
+        const realImplementPath = realpathSync(implementPath);
+        if (isPathInside(taskPath, realImplementPath) && statSync(realImplementPath).isFile()) {
+          checklist = parseChecklist(readFileSync(realImplementPath, "utf8"));
         }
-      } catch {
-        checklist = null;
       }
+    } catch {
+      checklist = null;
     }
   }
 
-  const snapshot: BoardSnapshot = {
+  return finish({
     available: true,
     degraded: false,
     root,
-    contextKey: resolved.key,
+    contextKey: resolvedSession.key,
     sourceType,
-    taskPath: realTaskDir,
+    taskPath,
     taskId,
     taskName,
     statusRaw,
     planning,
     checklist,
-  };
-  snapshot.fingerprint = computeFingerprint(snapshot, identity);
-  return snapshot;
+  }, identity);
+}
+
+/** Load the current snapshot from the nearest Trellis ancestor (legacy API). */
+export function loadSnapshot(cwd: string, identity: SessionIdentity, trusted: boolean): BoardSnapshot {
+  if (!trusted) return { available: false, degraded: false, reason: "untrusted" };
+  const root = findTrellisRoot(cwd);
+  if (!root) return { available: false, degraded: false, reason: "not-trellis" };
+  return loadSnapshotAtRoot(root, identity, trusted);
 }

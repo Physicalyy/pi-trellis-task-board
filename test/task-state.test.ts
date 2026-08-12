@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   findTrellisRoot,
+  findTrellisRoots,
   hash,
   isPathInside,
   loadSnapshot,
@@ -86,7 +87,34 @@ test("findTrellisRoot ignores .pi-only and non-Trellis dirs", () => {
   const root = tmpRepo();
   mkdirSync(join(root, ".pi"), { recursive: true });
   assert.equal(findTrellisRoot(root), null);
+  assert.deepEqual(findTrellisRoots(root), []);
   rmSync(root, { recursive: true, force: true });
+});
+
+test("findTrellisRoots returns nearest cwd root through outer workspace root", () => {
+  const workspace = tmpRepo();
+  mkdirSync(join(workspace, ".trellis", "tasks"), { recursive: true });
+  const child = join(workspace, "platform", "repo-a");
+  mkdirSync(join(child, ".trellis", "tasks"), { recursive: true });
+  const business = join(child, "src", "feature");
+  mkdirSync(business, { recursive: true });
+  assert.deepEqual(findTrellisRoots(business), [child, workspace]);
+  assert.deepEqual(findTrellisRoots(child), [child, workspace]);
+  assert.deepEqual(findTrellisRoots(workspace), [workspace]);
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+test("findTrellisRoots does not follow cwd symlink into an unrelated outer root", () => {
+  const workspace = tmpRepo();
+  const outside = tmpRepo();
+  mkdirSync(join(workspace, ".trellis", "tasks"), { recursive: true });
+  mkdirSync(join(outside, ".trellis", "tasks"), { recursive: true });
+  const link = join(workspace, "linked-outside");
+  let linked = false;
+  try { symlinkSync(outside, link, "dir"); linked = true; } catch { /* unsupported */ }
+  if (linked) assert.deepEqual(findTrellisRoots(link), [outside]);
+  rmSync(workspace, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
 });
 
 test("isPathInside uses path-relative semantics", () => {
@@ -194,6 +222,57 @@ test("loadSnapshot: ref escaping .trellis/tasks degrades", () => {
   assert.equal(snap.degraded, true);
   assert.ok(["bad-task-ref", "task-outside-tasks", "missing-task-dir"].includes(snap.reason ?? ""));
   rmSync(root, { recursive: true, force: true });
+});
+
+test("loadSnapshot: session directory symlink escape degrades (when symlinks supported)", () => {
+  const root = tmpRepo();
+  writeTask(root, "T1", "in_progress", "- [ ] a\n");
+  const outside = mkdtempSync(join(tmpdir(), "ttb-sessions-out-"));
+  const runtime = join(root, ".trellis", ".runtime");
+  mkdirSync(runtime, { recursive: true });
+  writeFileSync(join(outside, "pi_s1.json"), JSON.stringify({ current_task: ".trellis/tasks/T1" }), "utf8");
+  let linked = false;
+  try {
+    symlinkSync(outside, join(runtime, "sessions"), "dir");
+    linked = true;
+  } catch {
+    /* symlinks unsupported on this host */
+  }
+  if (linked) {
+    const snapshot = loadSnapshot(root, { sessionId: "s1" }, true);
+    assert.equal(snapshot.available, false);
+    assert.equal(snapshot.degraded, true);
+    assert.equal(snapshot.reason, "session-outside-root");
+  }
+  rmSync(root, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test("loadSnapshot: task.json and implement.md symlink escapes are not read", () => {
+  const root = tmpRepo();
+  const taskDir = writeTask(root, "T1", "in_progress", "- [ ] safe\n");
+  writeSession(root, "pi_s1", ".trellis/tasks/T1");
+  const outside = mkdtempSync(join(tmpdir(), "ttb-task-files-out-"));
+  writeFileSync(join(outside, "task.json"), JSON.stringify({ id: "EVIL", status: "in_progress" }), "utf8");
+  writeFileSync(join(outside, "implement.md"), "- [ ] escaped\n", "utf8");
+  let linked = false;
+  try {
+    rmSync(join(taskDir, "task.json"));
+    rmSync(join(taskDir, "implement.md"));
+    symlinkSync(join(outside, "task.json"), join(taskDir, "task.json"), "file");
+    symlinkSync(join(outside, "implement.md"), join(taskDir, "implement.md"), "file");
+    linked = true;
+  } catch {
+    /* symlinks unsupported on this host */
+  }
+  if (linked) {
+    const snapshot = loadSnapshot(root, { sessionId: "s1" }, true);
+    assert.equal(snapshot.available, false);
+    assert.equal(snapshot.degraded, true);
+    assert.equal(snapshot.reason, "bad-task-json");
+  }
+  rmSync(root, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
 });
 
 test("loadSnapshot: symlink escape from tasks degrades (when symlinks supported)", () => {

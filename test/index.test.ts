@@ -97,7 +97,7 @@ test("extension renders the aggregate widget and exposes aggregate list details"
     };
     const component = (widget as unknown as Function)({}, theme);
     const lines = component.render(48) as string[];
-    assert.ok(lines[0].includes("多根聚合"));
+    assert.ok(lines[0].includes("工作区"));
     assert.ok(lines.some((l) => l.includes("platform/repo-a")));
     for (const l of lines) {
       assert.ok(visibleWidth(l) <= 48, `width overflow: ${JSON.stringify(l)}`);
@@ -114,6 +114,7 @@ test("extension renders the aggregate widget and exposes aggregate list details"
     };
     const result = await tool.execute(null, { action: "list" }, null, null, context(root, true));
     assert.equal(result.details.mode, "aggregate");
+    assert.equal(result.details.activeBinding, "bound");
     const repos = result.details.repositories as Array<{
       relativePath: string;
       readOnly: boolean;

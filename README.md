@@ -1,208 +1,192 @@
 # Trellis Task Board (Pi Package)
 
 A [Pi](https://pi.dev) package that renders a persistent **`trellis-task-board`**
-widget above the editor, synced with the current project's Trellis task files.
-It shows the active task, its real lifecycle status, the coarse workflow phase,
-checkbox completion progress and the current step — without asking the AI to
-report on it.
+widget above the editor from trusted Trellis task files. It separates two facts
+that Trellis intentionally keeps independent:
 
-In **polyrepo workspaces** the widget becomes a multi-root aggregate board: it
-keeps showing the workspace coordination task while also summarizing each
-repository declared in the root `.trellis/config.yaml` `packages` map (all its
-non-archived tasks, lifecycle counts and checklist progress).
+- **Workspace progress:** lifecycle/checklist summaries for the outer workspace
+  and its nested Trellis repositories.
+- **Current execution binding:** the one task explicitly bound to the current
+  Pi session, if exactly one discovered Trellis root has that binding.
+
+The package never chooses a task from status or timestamps. An `in_progress`
+task from another Pi session contributes to the overview but is not presented
+as the current session's executing task.
 
 - **License:** MIT — see [LICENSE](./LICENSE).
-- **Source of truth:** the project's own Trellis runtime files
-  (`.trellis/.runtime/sessions/<key>.json`, `task.json`, and `implement.md`),
-  plus `.trellis/config.yaml` `packages` for multi-root discovery. No separate
-  session todo list is created.
+- **Source of truth:** `.trellis/.runtime/sessions/`, direct non-archive task
+  directories, `task.json`, `implement.md`, optional `config.yaml` packages,
+  and safe root-task `meta.owner-repo` / `meta.local-task` mappings.
 
 ---
 
 ## Installation
 
-Install at **user scope** (default) so the board serves any trusted Trellis
-project without touching the project's `.pi/settings.json`:
+Install at user scope so the board works in any trusted Trellis project without
+changing project `.pi/settings.json`:
 
 ```bash
 pi install git:github.com/Physicalyy/pi-trellis-task-board
 ```
 
-> The `-l` (project-local) flag is intentionally **not** used. This package is
-> recorded in `~/.pi/agent/settings.json`, outside Trellis-managed files.
-
-### Reproducible (pinned ref) install
-
-For repeatable team installs, pin a released tag or commit. Pinned refs are
-reconciled by `pi update` but never advanced to a newer ref automatically —
-changing the ref requires an explicit install/update decision:
+For reproducible installs, pin a release or commit:
 
 ```bash
 pi install git:github.com/Physicalyy/pi-trellis-task-board@v0.1.0
 ```
 
-### Local / latest-channel validation
+Local validation and removal:
 
 ```bash
-pi -e /absolute/path/to/pi-trellis-task-board          # ephemeral load, no install
-pi install /absolute/path/to/pi-trellis-task-board     # local path (reversible)
-pi remove  /absolute/path/to/pi-trellis-task-board     # remove the identical source
-```
-
-### Uninstall
-
-Remove with the exact installed source:
-
-```bash
+pi -e /absolute/path/to/pi-trellis-task-board
+pi install /absolute/path/to/pi-trellis-task-board
+pi remove  /absolute/path/to/pi-trellis-task-board
 pi remove git:github.com/Physicalyy/pi-trellis-task-board
 ```
 
 ---
 
-## Usage
+## Workspace discovery
 
-The widget mounts above the editor with the visible title `trellis-task-board`
-when all of these hold:
+After `ctx.isProjectTrusted()` succeeds, the extension:
 
-1. the project is trusted by Pi (`ctx.isProjectTrusted()`);
-2. walking up from the current directory finds a `.trellis/` nearest ancestor;
-3. a current task can be uniquely resolved for the Pi session.
+1. canonicalizes `cwd` and collects Trellis roots on its ancestor chain;
+2. uses the nearest root as the **cwd repository** and the outermost root as the
+   **workspace boundary**;
+3. merges nested repositories from, in priority order:
+   - valid root `config.yaml` `packages.<name>.path` entries;
+   - safe root task `meta.owner-repo` paths;
+   - bounded read-only discovery inside the canonical workspace root;
+4. canonicalizes and realpath-deduplicates every repository.
 
-Non-Trellis, untrusted, no-task, ambiguous-session and malformed states simply
-deactivate the widget or show a safe localized `!` degradation note — the board
-never fabricates approval, blockers or an exact Phase 3 position.
+Automatic discovery means a workspace without `packages` configuration still
+shows nested Trellis repositories when Pi starts at the workspace root, a child
+repository root, or a business subdirectory. Explicit packages remain supported
+and keep their configured display names.
 
-For checkbox plans, the compact widget shows recent completed context, labels
-the first unchecked item as `→ 下一步` (next step, not proven in-progress), and
-uses `□` for later pending items. `后续 N 项` counts only genuinely unchecked
-items hidden after the compact window; hidden completed history is not reported
-as remaining work. Fixed UI and mutation messages are displayed in Simplified
-Chinese. Task text itself remains exactly as authored in `implement.md`.
+Discovery does **not** recursively search the disk. It remains inside the outer
+workspace, does not traverse directory symlinks, rejects symlink escapes, has a
+fixed depth and directory budget, and skips management/build/cache directories
+including `.git`, `.trellis`, `node_modules`, `dist`, `build`, `target`,
+`coverage`, `.cache`, `.next`, `.nuxt`, `.turbo`, and hidden directories.
+Archive tasks are excluded. Local read failures and budget exhaustion become
+visible diagnostics without hiding repositories that were read safely.
 
-### Multi-root aggregate mode
+A project with no nested repositories keeps the single-root board behavior.
+Untrusted and non-Trellis projects deactivate quietly.
 
-When the trusted root `.trellis/config.yaml` declares a non-empty `packages`
-map, the board switches to a two-layer aggregate view:
+---
 
-- **Workspace layer:** the root's current task (title, lifecycle status and
-  checklist ratio), or an explicit `无当前任务` when the session has no task.
-- **Repository layer:** declared packages are `├─/└─` group nodes with their
-  completed/total task-lifecycle counts. Repository-local tasks are nested
-  beneath them with the original single-root glyphs: `✓` completed, `→`
-  in-progress/current, `□` planning/future, `·` legacy and `?` unknown. A
-  machine-readable active task is paired with its concrete first unchecked
-  `→ 下一步：...` item when the 8-row budget permits; multiple active tasks are
-  ordered with machine-readable progress first. Missing checklist data is
-  reported as `进度不可计算`, never `0/N`. Repositories that do not fit use the
-  narrow-safe marker `+N 仓库折叠 · /trellis-tasks`.
+## Session binding and mutation
 
-Package discovery is explicit only:
+The same current Pi `SessionIdentity` is resolved independently in the workspace
+root and every discovered child root:
 
-- Packages come solely from the root `config.yaml` `packages` map — never a
-  recursive scan of nested `.trellis/` directories.
-- Only the `path` field is used; `git`, `type` and other fields are ignored.
-- Every package/task path must pass realpath containment inside the workspace
-  root; package self-reference (pointing at the root itself) is rejected and
-  canonical duplicates are deduplicated.
-- `.trellis/tasks/archive/` is fully excluded from every repository: archived
-  tasks never appear in the list and never count toward completed/total.
+- **0 matches:** overview remains visible with `当前会话未绑定执行任务`;
+- **1 match:** overview plus that task's ordered checklist are shown;
+- **2+ matches:** a binding ambiguity warning is shown and the extension refuses
+  to guess or write.
 
-The workspace task (and its active direct children) can link to repository
-tasks through `task.json.meta.owner-repo` + `meta.local-task`. The link only
-**reports** a coordination-vs-implementation status difference; it never syncs
-or rewrites either side. Missing or invalid mappings produce a localized
-warning without hiding the repository's own task overview.
-
-Configuration outcomes are distinct:
-
-- `packages` missing/empty → plain single-root board (no aggregate view).
-- `packages` declared but unparseable/malformed or every entry rejected →
-  aggregate-degraded view that keeps the workspace task and shows per-entry
-  diagnostics; it never silently falls back to the single-root style.
-- At least one valid package → normal aggregate view; invalid packages are
-  localized diagnostics next to the valid repositories.
-
-### `/trellis-tasks`
-
-Opens a full, scrollable list of the board in TUI mode (↑/↓ or PgUp/PgDn to
-scroll, `q`/`Esc` to close) with a concise footer fallback elsewhere. In
-aggregate mode it lists the workspace task, the root writable scope, every
-configured repository's non-archived tasks with complete checklists, all
-links/status differences and every diagnostic. It uses the same glyph and tree
-semantics as the compact widget while keeping root mutation numbers separate
-from read-only repository checklist glyphs.
+In multi-root mode only explicit current-session key candidates are accepted.
+The single-file historical session fallback remains available for compatible
+single-root projects, but is not used to turn another session into a current
+workspace binding.
 
 ### Model tool: `trellis_task_board`
 
-- `list` — return the current board without writing. In aggregate mode the
-  output separates the **root writable scope** (the root current task's
-  mutable checkbox list, numbered 1-based) from the **read-only sub-repository
-  lists** (glyphs only, no mutation numbers, so a sub-repository item can never
-  be targeted by `set_completed`).
-- `set_completed` — toggle a single checkbox in `implement.md`
-  (`item` = 1-based number, `expectedText` = exact item text, `completed`).
-  It only ever targets the **current Trellis root's current task**; it accepts
-  no repository or task path, so sub-repository aggregate data stays read-only.
+- `list` returns the board, workspace/cwd roots, active-binding state, and marks
+  repository summaries read-only.
+- `set_completed` accepts only a 1-based checkbox number, exact expected text,
+  and desired checked state. It accepts no repository, task, or filesystem path.
 
-`set_completed` is available only for a real checkbox checklist in a trusted
-Trellis task. Legacy numbered plans and planning-state tasks are read-only.
+`mutation.ts` remains the only product write boundary. For a uniquely bound
+root (workspace or child), `set_completed` re-resolves the complete workspace
+binding inside `withFileMutationQueue`, canonicalizes `implement.md`, checks
+containment and expected text again, then changes exactly one ASCII marker
+(`[ ]` ↔ `[x]`) while preserving all other bytes and line endings. Unbound,
+ambiguous, planning, legacy, malformed, stale, escaped, and untrusted states are
+read-only. No other repository can be selected by tool parameters.
 
 ---
 
-## What the board shows (and never shows)
+## Widget and `/trellis-tasks`
 
-| `task.json.status` | Board display |
+The compact widget is capped at eight lines in workspace mode and prioritizes:
+
+1. `trellis-task-board` plus aggregate completed/total task lifecycle count;
+2. current session binding, or an explicit unbound/ambiguous message;
+3. a source-contiguous checklist window for the uniquely bound task;
+4. repository summaries and a narrow-safe `/trellis-tasks` fold marker.
+
+`/trellis-tasks` opens the full scrollable board in TUI mode and uses a concise
+footer elsewhere. It shows all non-archive repository tasks, diagnostics,
+mappings, and read-only checklists. Only the uniquely bound writable checklist
+has 1-based mutation numbers.
+
+### Checkbox semantics
+
+Checkbox output intentionally has no inferred “currently executing checklist
+item” state:
+
+- `✓` — completed checkbox;
+- `□` — unchecked checkbox;
+- `·` — legacy/read-only plan item;
+- `?` — malformed or unknown row/task state where applicable.
+
+Checklist rows remain in `implement.md` source order. The first `□` is naturally
+the next ordered item, but the board does not relabel it as `→ 下一步` or claim
+that work has started. Compact windows are contiguous source slices; when rows
+after the slice are hidden, `… 还有 N 项` reports the exact hidden row count.
+
+### Theme and accessibility
+
+All color and emphasis comes from Pi's current theme API; the package contains
+no fixed ANSI colors, RGB values, or terminal palette assumptions:
+
+- completed `✓` and body are dim; completed body is struck through;
+- every pending `□` glyph uses `accent`;
+- only the first pending body uses `accent` + bold;
+- later pending bodies use normal `text`;
+- paths/counts/truncation use muted/dim styling;
+- diagnostics use warning/error roles.
+
+Styling is segmented rather than painting the whole board accent. Glyphs,
+source order, lifecycle words, explicit binding text, and read-only labels keep
+all meaning available without color. Plain semantic segments are CJK-width
+bounded before theme styling; tests cover ANSI output at 32, 48, and 80 columns.
+
+---
+
+## Truthful status model
+
+| `task.json.status` | Display |
 | --- | --- |
-| `planning` | `规划 · 阶段 1 · 等待激活` (PRD/Design/Plan/context gates), even if `implement.md` already exists |
-| `in_progress` | `进行中 · 阶段 2/3 · N/M` when a checkbox checklist exists; otherwise `进行中 · 阶段 2/3` with no fabricated ratio |
+| `planning` | `规划 · 阶段 1 · 等待激活`; no execution ratio |
+| `in_progress` | `进行中 · 阶段 2/3 · N/M` only with a real checkbox checklist |
 | `completed` | `已完成 · 阶段 3` |
-| `review` / unknown | localized review label or raw sanitized unknown status, with no invented phase precision |
+| `review` / unknown | distinct review/raw status; no invented phase precision |
 
-Repository `completed/total` counts task lifecycle status only (non-archived
-tasks); per-task checklist items are never summed into a repository ratio.
-Aggregate labels and status suffixes stay left-aligned next to their object;
-32/48/80-column rendering preserves the tree prefix and semantic suffix while
-truncating only long titles/paths with `…`. Completed rows are dimmed and struck
-through, current rows use the theme accent plus bold, and future rows remain
-plain, so color is never the only signal. The horizontal line beneath the
-widget is Pi's native editor/widget boundary and is not rendered by this
-package. When a checklist has no machine-readable progress the board says
-`进度不可计算` instead of inventing `0/N`. `!` always means *board data
-degraded/unreadable* (missing, malformed, ambiguous or unsafe files) — never a
-fabricated task blocker.
+Repository `completed/total` counts non-archive task lifecycle statuses only;
+checklist rows are never added to that ratio. Missing machine-readable progress
+is `进度不可计算`, never fabricated `0/N`. A `!` row is a board data-quality or
+safety diagnostic, never an inferred task blocker.
 
 ---
 
-## Compatibility & security boundary
+## Compatibility and security
 
 - **Supported:** Pi CLI 0.84.x, Node.js ≥ 20.
-- **Runtime dependency:** `yaml` (used to parse `.trellis/config.yaml`
-  `packages`). Pi-owned modules are `peerDependencies` with matching dev copies
-  for standalone type-checking/tests.
-- **Reads:** only trusted Trellis projects. Path containment is realpath-based
-  (`node:path.relative`), so traversal, absolute external refs and symlink
-  escapes are rejected. Aggregate discovery reads only the declared packages
-  and their `.trellis/tasks/`; it never touches archived tasks or unconfigured
-  directories.
-- **The only write:** one ASCII checkbox marker (`[ ]` ↔ `[x]`) in an existing
-  canonical `implement.md` inside the **current root's** `.trellis/tasks/`. It
-  never creates files and never accepts an arbitrary path (and no sub-repository
-  path is ever writable). The write re-resolves the session, task and file
-  inside `withFileMutationQueue` and re-validates the item text.
-- **Never modified:** `.trellis/scripts/`, `.trellis/workflow.md`,
-  `.pi/extensions/trellis/`, project `.pi/settings.json`, official
-  agents/prompts/skills, any sub-repository Trellis task, or any other
-  Trellis-managed file.
-- **Session pointer** (`.trellis/.runtime/sessions/`) is local-only and
-  gitignored; the board reflects the local dev's current task. If a task is
-  started from a plain terminal without `TRELLIS_CONTEXT_ID`, no session file is
-  written and the workspace block shows "no task" — an expected degradation,
-  not a bug. With a valid `packages` declaration the repository layer still
-  renders.
+- **Runtime dependency:** `yaml`; Pi-owned packages remain peer dependencies.
+- **Reads:** trusted workspace only; canonical realpath containment protects
+  workspace, `.trellis`, tasks, packages, metadata references, and discovery.
+- **Writes:** exactly one checkbox marker in the uniquely current-session-bound
+  task's existing canonical `implement.md`; never arbitrary paths or multiple
+  roots.
+- **Never modified:** Trellis scripts/workflows/templates, project Pi settings,
+  session pointers, target-project configuration, archives, or unrelated tasks.
 
-> **Security note:** Pi packages execute with full system access. Review the
-> source before installing third-party packages. This package's only system
-> mutation is the checkbox marker described above.
+> Pi packages execute with full system access. Review third-party package source
+> before installation.
 
 ---
 
@@ -212,13 +196,8 @@ fabricated task blocker.
 npm ci
 npm run typecheck
 npm test
-npm run pack:check        # npm pack --dry-run
+npm run pack:check
 ```
-
-The parser, state loader, aggregate state, key algorithms and width helpers are
-pure Node and are covered by unit tests. `extension`/`task-state` loading and
-the widget visuals are validated in an interactive Pi session (see the widget
-above and `/trellis-tasks`).
 
 ---
 
